@@ -1,0 +1,16 @@
+.claude/
+.venv-harbor/
+
+# Harbor task output directories
+harbor-tasks/
+
+# Duplicated mini-swe-agent copies (kept only in template/)
+**/environment/mini-swe-agent/
+
+# MTL pipeline build artifacts
+*.egg-info/
+src/mtl/**/__pycache__/
+dist/
+build/
+jobs/
+memories/

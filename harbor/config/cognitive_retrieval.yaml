@@ -1,0 +1,45 @@
+# =============================================================================
+# Cognitive Memory Retrieval Configuration
+# =============================================================================
+# All tunable parameters for the retrieval pipeline in one place.
+# For ablation experiments, modify this file and re-run — no code changes needed.
+#
+# Pipeline: embedding recall (top_n) -> LLM cognitive rerank -> synergy select -> threshold filter
+#
+# Quick ablation cheat sheet:
+#   E2 (no LLM rerank):     features.use_cognitive_rerank = false
+#   E3 (no synergy):        features.use_llm_synergy = false
+#   E4 (single channel):    weights.alpha_dual_task = 1.0
+#   E6 (fixed threshold):   threshold.score_threshold_std = 0
+#   E23 (pure embedding):   features.use_cognitive_rerank = false, features.use_llm_synergy = false
+# =============================================================================
+
+# ---- Feature Toggles --------------------------------------------------------
+features:
+  use_cognitive_rerank: true    # Step 3: LLM dimension-aware rerank
+  use_llm_synergy: true         # Step 4: LLM synergy/conflict detection
+
+# ---- Fusion Weights ---------------------------------------------------------
+weights:
+  # Embedding fusion: task_text vs cognitive_text (within semantic retrieval)
+  #   final = alpha * task_similarity + (1-alpha) * cognitive_similarity
+  #   1.0 = pure task-text embedding (single channel)
+  alpha_dual_task: 0.70
+
+  # Score fusion: semantic vs LLM cognitive (after rerank)
+  #   combined = alpha_semantic * semantic + alpha_cognitive * cognitive
+  #   Higher alpha_semantic = trust embedding more; higher alpha_cognitive = trust LLM more
+  alpha_semantic: 0.35
+  alpha_cognitive: 0.65
+
+# ---- Retrieval Settings -----------------------------------------------------
+retrieval:
+  top_n_candidates: 20          # Candidates recalled before rerank
+  top_k: 3                      # Final memories injected into prompt
+  min_memories: 1               # Minimum kept regardless of scores
+
+# ---- Dynamic Threshold ------------------------------------------------------
+threshold:
+  score_threshold_floor: 0.45   # Absolute minimum combined_score
+  score_threshold_std: 0.5      # threshold = max(floor, median - std * stdev)
+                                # Set to 0 for fixed threshold (E6)

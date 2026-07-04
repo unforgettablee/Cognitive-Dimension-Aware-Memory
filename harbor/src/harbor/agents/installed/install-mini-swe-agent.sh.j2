@@ -1,0 +1,43 @@
+#!/bin/bash
+set -e
+
+# Use Tsinghua PyPI mirror for faster downloads
+export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+# Ensure uv is in PATH
+if [ -f "$HOME/.local/bin/env" ]; then
+    source "$HOME/.local/bin/env"
+fi
+
+# Install mini-swe-agent if not already present
+if ! command -v mini &>/dev/null; then
+    {% if version %}
+    uv tool install git+https://github.com/li-boxuan/mini-swe-agent.git@{{ version }}
+    {% else %}
+    uv tool install git+https://github.com/li-boxuan/mini-swe-agent.git
+    {% endif %}
+
+    # Patch litellm cost calculation to not crash on unmapped models (e.g. deepseek-v4-flash)
+    LITELLM_FILE=$(find "$HOME/.local/share/uv/tools/mini-swe-agent" -path "*/minisweagent/models/litellm_model.py" 2>/dev/null | head -1)
+    if [ -n "$LITELLM_FILE" ]; then
+        python3 -c "
+import re
+p = '$LITELLM_FILE'
+c = open(p).read()
+match = re.search(r'^(\s*)cost = litellm\.cost_calculator\.completion_cost\(response\)', c, re.MULTILINE)
+if match:
+    indent = match.group(1)
+    old = match.group(0)
+    new = f'{indent}try:\n{indent}    cost = litellm.cost_calculator.completion_cost(response)\n{indent}except Exception:\n{indent}    cost = 0'
+    c = c.replace(old, new)
+    open(p, 'w').write(c)
+    print('PATCHED:', p)
+else:
+    print('ALREADY PATCHED or NOT FOUND')
+"
+    fi
+else
+    echo "mini-swe-agent already installed: $(which mini)"
+fi
+
+echo "INSTALL_SUCCESS"

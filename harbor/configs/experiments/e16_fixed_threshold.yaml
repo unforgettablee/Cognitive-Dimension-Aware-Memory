@@ -1,0 +1,36 @@
+name: e16_fixed_threshold
+description: 'Sequential: full system with fixed threshold — no dynamic per-pool threshold'
+tasks_dir: harbor-tasks/swebench-verified
+start_index: 0
+end_index: 500
+num_tasks: 100
+random_seed: 42
+agent: mini-swe-agent
+model: deepseek/deepseek-chat
+llm:
+  api_key: ''
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
+use_memory: true
+pool_dir: memories/sequential-pool-e16
+jobs_dir: jobs/sequential/e16_fixed_threshold
+only_passed: true
+derive_traditional_memory: true
+agent_kwargs:
+  step_limit: 150
+retrieval_config:
+  features:
+    use_cognitive_rerank: true
+    use_llm_synergy: true
+    retrieval_source: cognitive
+  weights:
+    alpha_dual_task: 0.7
+    alpha_semantic: 0.35
+    alpha_cognitive: 0.65
+  retrieval:
+    top_n_candidates: 20
+    top_k: 3
+    min_memories: 1
+  threshold:
+    score_threshold_floor: 0.45
+    score_threshold_std: 0.0

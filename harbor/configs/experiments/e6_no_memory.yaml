@@ -1,0 +1,32 @@
+# E6: No memory baseline (sequential)
+# Each task runs independently — no memory retrieval at all
+name: "e6_no_memory"
+description: "Sequential baseline: no memory retrieval, tasks run independently"
+
+tasks_dir: "harbor-tasks/swebench-verified"
+start_index: 0
+end_index: 500
+num_tasks: null
+random_seed: 42
+
+agent: "mini-swe-agent"
+model: "deepseek/deepseek-chat"
+
+llm:
+  api_key: ""
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+
+use_memory: false
+pool_dir: ""
+jobs_dir: "jobs/sequential/e6_no_memory"
+only_passed: false
+derive_traditional_memory: false
+
+agent_kwargs:
+  step_limit: 150
+
+retrieval_config:
+  features:
+    use_cognitive_rerank: false
+    use_llm_synergy: false

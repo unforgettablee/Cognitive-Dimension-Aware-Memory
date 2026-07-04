@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  mtl:
+    build: .
+    image: mtl-pipeline:latest
+    environment:
+      - API_KEY=${API_KEY}
+      - COGNITIVE_RETRIEVAL_CONFIG=/app/harbor/config/cognitive_retrieval.yaml
+    volumes:
+      - ./memories:/app/memories
+      - ./jobs:/app/jobs
+      - ./harbor-tasks:/app/harbor-tasks
+      - ./harbor/config:/app/harbor/config
+      - ./harbor/configs:/app/harbor/configs
+    working_dir: /app
+    entrypoint: ["mtl"]
+    # Example: override command to run a specific experiment
+    # command: ["experiment", "-c", "harbor/configs/experiments/e1_full.yaml"]

@@ -1,0 +1,36 @@
+[project]
+name = "memory-transfer-learning"
+version = "1.0.0"
+description = "Memory Transfer Learning (MTL): Cross-domain memory transfer for coding agents with 4x4 cognitive matrix retrieval"
+readme = "README.md"
+authors = [
+    { name = "Kangsan Kim", email = "kangsan.kim@kaist.ac.kr" },
+    { name = "Minki Kang" },
+    { name = "Taeil Kim" },
+    { name = "Yanlai Yang" },
+    { name = "Mengye Ren" },
+    { name = "Sung Ju Hwang" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26.0",
+    "sentence-transformers>=3.0.0",
+    "openai>=1.0.0",
+    "pyyaml>=6.0.2",
+    "filelock>=3.13.0",
+    "rich>=13.0.0",
+    "typer>=0.16.0",
+]
+
+[project.scripts]
+mtl = "mtl.cli.main:app"
+
+[project.optional-dependencies]
+harbor = ["harbor>=0.1.18", "swebench>=3.1", "datasets>=3.0"]
+
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
