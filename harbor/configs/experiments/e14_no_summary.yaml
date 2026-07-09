@@ -1,5 +1,6 @@
-name: e4_pure_embedding
-description: 'Sequential: pure embedding similarity top-K — no LLM rerank/synergy'
+name: e14_no_summary
+description: 'Sequential: full system without summary abstraction level — trajectory+workflow
+  only'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
@@ -12,25 +13,28 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e4
-jobs_dir: jobs/sequential/e4_embedding
+pool_dir: memories/sequential-pool-e14
+jobs_dir: jobs/sequential/e14_no_summary
 only_passed: true
 derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels:
+- summary
 agent_kwargs:
   step_limit: 150
 retrieval_config:
   features:
-    use_cognitive_rerank: false
-    use_llm_synergy: false
+    use_cognitive_rerank: true
+    use_llm_synergy: true
     retrieval_source: cognitive
   weights:
-    alpha_dual_task: 1.0
-    alpha_semantic: 1.0
-    alpha_cognitive: 0.0
+    alpha_dual_task: 0.7
+    alpha_semantic: 0.35
+    alpha_cognitive: 0.65
   retrieval:
     top_n_candidates: 20
     top_k: 3
     min_memories: 0
   threshold:
-    score_threshold_floor: 0.0
-    score_threshold_std: 0.0
+    score_threshold_floor: 0.45
+    score_threshold_std: 0.5

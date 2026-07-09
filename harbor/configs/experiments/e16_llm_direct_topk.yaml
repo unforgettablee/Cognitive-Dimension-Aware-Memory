@@ -1,4 +1,4 @@
-name: e15_llm_direct_topk
+name: e16_llm_direct_topk
 description: 'Sequential: LLM directly selects top-K from candidates — no 4x4 dimension
   partition'
 tasks_dir: harbor-tasks/swebench-verified
@@ -13,10 +13,12 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e15
-jobs_dir: jobs/sequential/e15_llm_direct
+pool_dir: memories/sequential-pool-e16
+jobs_dir: jobs/sequential/e16_llm_direct
 only_passed: true
 derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels: []
 use_direct_llm_topk: true
 agent_kwargs:
   step_limit: 150

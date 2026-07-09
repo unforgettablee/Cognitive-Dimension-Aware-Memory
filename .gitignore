@@ -15,5 +15,8 @@ build/
 jobs/
 memories/
 
+# Ablation experiment backups
+harbor/configs/experiments_backup/
+
 # LaTeX files
 *.tex

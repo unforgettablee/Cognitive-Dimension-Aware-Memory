@@ -1,7 +1,7 @@
-# E14: Random memory retrieval (sanity check)
+# E15: Random memory retrieval (sanity check)
 # Randomly sample 3 memories from the pool instead of using COGENT retrieval.
 # Answers: is ANY memory better than none? Does COGENT retrieval beat random?
-name: "e14_random_memory"
+name: "e15_random_memory"
 description: "Sequential: random memory sampling baseline — no embedding/LLM retrieval"
 
 tasks_dir: "harbor-tasks/swebench-verified"
@@ -19,10 +19,12 @@ llm:
   model: "deepseek-chat"
 
 use_memory: true
-pool_dir: "memories/sequential-pool-e14"
-jobs_dir: "jobs/sequential/e14_random_memory"
+pool_dir: "memories/sequential-pool-e15"
+jobs_dir: "jobs/sequential/e15_random_memory"
 only_passed: true
 derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels: []
 
 # TODO: Requires code support — use_random_retrieval skips the entire COGENT
 # retrieval pipeline (embedding + rerank + synergy) and randomly picks top_k

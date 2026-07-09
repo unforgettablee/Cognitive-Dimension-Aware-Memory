@@ -1,21 +1,25 @@
-name: e25_gpt4o
-description: 'Sequential: full system with GPT-4o — model independence validation'
+name: e9_no_contrastive
+description: 'Sequential: full system without contrastive dimension — causal+strategic+environment
+  only'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
 num_tasks: 100
 random_seed: 42
 agent: mini-swe-agent
-model: openai/gpt-4o
+model: deepseek/deepseek-chat
 llm:
   api_key: ''
-  base_url: https://api.openai.com/v1
-  model: gpt-4o
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e25
-jobs_dir: jobs/sequential/e25_gpt4o
+pool_dir: memories/sequential-pool-e9
+jobs_dir: jobs/sequential/e9_no_contrastive
 only_passed: true
 derive_traditional_memory: true
+excluded_dimensions:
+- contrastive
+excluded_levels: []
 agent_kwargs:
   step_limit: 150
 retrieval_config:
@@ -30,7 +34,7 @@ retrieval_config:
   retrieval:
     top_n_candidates: 20
     top_k: 3
-    min_memories: 1
+    min_memories: 0
   threshold:
     score_threshold_floor: 0.45
     score_threshold_std: 0.5

@@ -32,6 +32,8 @@ class SequentialConfig:
     tasks_dir: str = "harbor-tasks/swebench-verified"
     start_index: int = 0
     end_index: int = 500  # Total tasks to run (exclusive)
+    num_tasks: int | None = None  # Random-sample N tasks (None = use start_index/end_index slice)
+    random_seed: int = 42  # Seed for task sampling and reproducibility
 
     # Agent configuration
     agent: str = "mini-swe-agent"
@@ -71,6 +73,10 @@ class SequentialConfig:
 
     # Memory extraction
     derive_traditional_memory: bool = True  # Derive traditional memories from cognitive matrix
+
+    # Ablation: exclude specific cognitive dimensions (e7--e10) or abstraction levels (e11--e13)
+    excluded_dimensions: list = field(default_factory=list)
+    excluded_levels: list = field(default_factory=list)
 
     # Execution
     jobs_dir: str = "jobs/sequential"

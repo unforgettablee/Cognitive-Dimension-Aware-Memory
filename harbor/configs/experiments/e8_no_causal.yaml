@@ -1,9 +1,10 @@
-name: e1_full_system
-description: Full COGENT pipeline with all features enabled --- only passed-task experiences (clean system)
+name: e8_no_causal
+description: 'Sequential: full system without causal dimension — contrastive+strategic+environment
+  only'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
-num_tasks: null
+num_tasks: 100
 random_seed: 42
 agent: mini-swe-agent
 model: deepseek/deepseek-chat
@@ -12,11 +13,12 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e1
-jobs_dir: jobs/sequential/e1_full
+pool_dir: memories/sequential-pool-e8
+jobs_dir: jobs/sequential/e8_no_causal
 only_passed: true
 derive_traditional_memory: true
-excluded_dimensions: []
+excluded_dimensions:
+- causal
 excluded_levels: []
 agent_kwargs:
   step_limit: 150

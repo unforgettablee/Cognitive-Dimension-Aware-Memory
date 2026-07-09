@@ -1,6 +1,5 @@
-name: e9_no_strategic
-description: 'Sequential: full system without strategic dimension — causal+contrastive+environment
-  only'
+name: e17_fixed_threshold
+description: 'Sequential: full system with fixed threshold — no dynamic per-pool threshold'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
@@ -13,12 +12,12 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e9
-jobs_dir: jobs/sequential/e9_no_strategic
+pool_dir: memories/sequential-pool-e17
+jobs_dir: jobs/sequential/e17_fixed_threshold
 only_passed: true
 derive_traditional_memory: true
-excluded_dimensions:
-- strategic
+excluded_dimensions: []
+excluded_levels: []
 agent_kwargs:
   step_limit: 150
 retrieval_config:
@@ -33,7 +32,7 @@ retrieval_config:
   retrieval:
     top_n_candidates: 20
     top_k: 3
-    min_memories: 1
+    min_memories: 0
   threshold:
     score_threshold_floor: 0.45
-    score_threshold_std: 0.5
+    score_threshold_std: 0.0

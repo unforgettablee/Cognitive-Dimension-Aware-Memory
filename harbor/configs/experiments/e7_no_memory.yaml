@@ -1,6 +1,6 @@
-# E6: No memory baseline (sequential)
+# E7: No memory baseline (sequential)
 # Each task runs independently — no memory retrieval at all
-name: "e6_no_memory"
+name: "e7_no_memory"
 description: "Sequential baseline: no memory retrieval, tasks run independently"
 
 tasks_dir: "harbor-tasks/swebench-verified"
@@ -19,9 +19,11 @@ llm:
 
 use_memory: false
 pool_dir: ""
-jobs_dir: "jobs/sequential/e6_no_memory"
+jobs_dir: "jobs/sequential/e7_no_memory"
 only_passed: false
 derive_traditional_memory: false
+excluded_dimensions: []
+excluded_levels: []
 
 agent_kwargs:
   step_limit: 150

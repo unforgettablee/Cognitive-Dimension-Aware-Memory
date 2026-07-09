@@ -1,21 +1,23 @@
-name: e26_claude_opus
-description: 'Sequential: full system with Claude Opus 4.5 — model independence validation'
+name: e2_full_all_experiences
+description: Full COGENT pipeline with all features enabled — all experiences including failed tasks (only_passed=false)
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
-num_tasks: 100
+num_tasks: null
 random_seed: 42
 agent: mini-swe-agent
-model: anthropic/claude-opus-4-5
+model: deepseek/deepseek-chat
 llm:
   api_key: ''
-  base_url: https://api.anthropic.com
-  model: claude-opus-4-5
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e26
-jobs_dir: jobs/sequential/e26_claude_opus
-only_passed: true
+pool_dir: memories/sequential-pool-e2
+jobs_dir: jobs/sequential/e2_full
+only_passed: false
 derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels: []
 agent_kwargs:
   step_limit: 150
 retrieval_config:
@@ -30,7 +32,7 @@ retrieval_config:
   retrieval:
     top_n_candidates: 20
     top_k: 3
-    min_memories: 1
+    min_memories: 0
   threshold:
     score_threshold_floor: 0.45
     score_threshold_std: 0.5

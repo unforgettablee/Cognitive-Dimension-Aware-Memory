@@ -16,8 +16,13 @@ import threading
 from pathlib import Path
 import numpy as np
 
-from mtl.retrieval.cognitive_rerank import extract_cognitive_query, cognitive_rerank
+from mtl.retrieval.cognitive_rerank import (
+    extract_cognitive_query,
+    cognitive_rerank,
+    _build_dimension_brief,
+)
 from mtl.retrieval.synergy import synergy_aware_selection, compute_selection_quality
+from mtl.llm import get_client, get_model
 
 _embed_model = None
 _embed_lock = threading.Lock()
@@ -43,6 +48,14 @@ def _get_embed_model():
 class CognitiveRetriever:
     """Unified retrieval with dimension-aware cognitive rerank + synergy."""
 
+    # Mapping from cognitive dimension names to their pkl file names.
+    _DIMENSION_TO_FILE = {
+        "causal": "causal_memory.pkl",
+        "contrastive": "contrastive_memory.pkl",
+        "strategic": "strategic_memory.pkl",
+        "environment": "environment_memory.pkl",
+    }
+
     def __init__(
         self,
         memory_dir: str,
@@ -56,6 +69,8 @@ class CognitiveRetriever:
         score_threshold_floor: float = 0.45,
         score_threshold_std: float = 0.5,
         min_memories: int = 1,
+        excluded_dimensions: list | None = None,
+        excluded_levels: list | None = None,
     ):
         """
         Args:
@@ -70,6 +85,10 @@ class CognitiveRetriever:
             score_threshold_floor: Absolute minimum combined_score
             score_threshold_std: Multiplier for dynamic threshold (higher = stricter)
             min_memories: Minimum memories to keep regardless of scores
+            excluded_dimensions: Cognitive dimensions to EXCLUDE from retrieval pool.
+                                 For dimension leave-one-out ablation (e7--e10).
+            excluded_levels: Abstraction levels to EXCLUDE from retrieval pool.
+                             For abstraction tier leave-one-out ablation (e11--e13).
         """
         self.memory_dir = Path(memory_dir)
         self.alpha_semantic = alpha_semantic
@@ -82,6 +101,8 @@ class CognitiveRetriever:
         self.score_threshold_floor = score_threshold_floor
         self.score_threshold_std = score_threshold_std
         self.min_memories = min_memories
+        self.excluded_dimensions = [d.strip().lower() for d in (excluded_dimensions or [])]
+        self.excluded_levels = [l.strip().lower() for l in (excluded_levels or [])]
 
         self.memories: list[dict] = []
         self._embeddings: np.ndarray | None = None
@@ -96,8 +117,27 @@ class CognitiveRetriever:
     # Loading
     # -----------------------------------------------------------
     def _load_all(self):
-        """Load all memory pkl files, separate insight layer, precompute embeddings."""
-        pkl_files = sorted(self.memory_dir.glob("*.pkl"))
+        """Load all memory pkl files, separate insight layer, precompute embeddings.
+
+        Excluded dimensions (e7--e10 ablation) are skipped at the file level:
+        their pkl files are never loaded.  Excluded levels (e11--e13 ablation)
+        are filtered after loading.
+        """
+        # Compute which pkl files to skip based on excluded dimensions.
+        _excluded_pkl_files: set[str] = set()
+        if self.excluded_dimensions:
+            for dim in self.excluded_dimensions:
+                pkl_name = self._DIMENSION_TO_FILE.get(dim)
+                if pkl_name:
+                    _excluded_pkl_files.add(pkl_name)
+            if _excluded_pkl_files:
+                print(f"[retriever] Excluded dimensions: {self.excluded_dimensions}"
+                      f"  (skipping: {sorted(_excluded_pkl_files)})")
+
+        pkl_files = sorted(
+            p for p in self.memory_dir.glob("*.pkl")
+            if p.name not in _excluded_pkl_files
+        )
         if not pkl_files:
             raise FileNotFoundError(f"No .pkl files found in {self.memory_dir}")
 
@@ -138,6 +178,17 @@ class CognitiveRetriever:
 
         if skipped_count > 0:
             print(f"  [retriever] Normalized {skipped_count} legacy entries (missing 'memory' key).")
+
+        # Filter by excluded abstraction levels (e11--e13 ablation).
+        if self.excluded_levels:
+            n_before = len(all_entries)
+            all_entries = [
+                e for e in all_entries
+                if e.get("level", "").lower() not in self.excluded_levels
+            ]
+            n_after = len(all_entries)
+            print(f"  [retriever] Excluded levels: {self.excluded_levels}"
+                  f"  (filtered {n_before - n_after} entries, {n_after} remain)")
 
         # Separate insight-level from concrete
         insight_entries: list[dict] = []
@@ -350,6 +401,241 @@ class CognitiveRetriever:
                   f"(task={s.get('task_score', 0):.3f} cog={s.get('cog_score', 0):.3f}) "
                   f"task={s.get('task_name','?')} "
                   f"(+{n_linked} insights)")
+
+        return selected
+
+    # -----------------------------------------------------------
+    # Random retrieval (E15 ablation)
+    # -----------------------------------------------------------
+    def retrieve_random(self, task_text: str, top_n: int = 20, top_k: int = 3) -> list[dict]:
+        """Semantic retrieval + random selection from top-N candidates.
+
+        Used by E15 (random memory ablation): runs the same dual-score semantic
+        retrieval as the normal pipeline (Steps 1--2), then uniformly samples K
+        memories from the top-N candidates instead of applying cognitive rerank
+        and synergy selection.
+        """
+        import random as _random_mod
+        rng = _random_mod.Random(42)  # Fixed seed for reproducibility
+
+        if not self.memories:
+            print("[retriever-random] No memories loaded, returning empty.")
+            return []
+
+        print(f"\n[retriever-random] Query: {task_text[:100]}...")
+
+        # Step 1: Extract cognitive profile
+        print("  [R1] Extracting cognitive query profile...")
+        query_profile = extract_cognitive_query(task_text)
+
+        cognitive_query_parts = []
+        cs = query_profile.get("causal_signature", {})
+        if cs:
+            cognitive_query_parts.append(cs.get("causal_signature", ""))
+            cognitive_query_parts.append(cs.get("error_category", ""))
+            cognitive_query_parts.append(cs.get("cause_category", ""))
+            cognitive_query_parts.append(cs.get("intervention_type", ""))
+            chain = cs.get("causal_chain", [])
+            if chain:
+                cognitive_query_parts.append(" -> ".join(chain))
+        for dim_name in ["contrastive_needs", "strategic_needs", "environment_needs"]:
+            val = query_profile.get(dim_name, "")
+            if val:
+                cognitive_query_parts.append(val)
+        cognitive_query_text = " ".join(
+            c for c in cognitive_query_parts if c and c != "other"
+        )
+
+        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        query_cog_emb = (
+            _get_embed_model().encode(cognitive_query_text).tolist()
+            if cognitive_query_text else None
+        )
+
+        # Step 2: Dual-score semantic retrieval
+        print(f"  [R2] Dual-score semantic retrieval (top {top_n})...")
+        candidates = self._semantic_retrieve(query_task_emb, query_cog_emb, top_n)
+
+        # Step 3: Random selection
+        print(f"  [R3] Randomly selecting {top_k} from {len(candidates)} candidates...")
+        n_pick = min(top_k, len(candidates))
+        selected = rng.sample(candidates, n_pick) if n_pick > 0 else []
+
+        # Attach insights
+        if self.attach_insights:
+            for mem in selected:
+                task = mem.get("task_name", "")
+                linked = self._task_to_insights.get(task, [])
+                mem["_linked_insights"] = linked
+                if linked:
+                    dims = [ins.get("type", "?") for ins in linked]
+                    print(f"    -> attached {len(linked)} insight(s) "
+                          f"[{', '.join(dims)}] from task={task}")
+
+        print(f"  [retriever-random] Selected {len(selected)} memories "
+              f"(random from top-{len(candidates)} semantic candidates)")
+        for i, s in enumerate(selected):
+            n_linked = len(s.get("_linked_insights", []))
+            print(f"    [{i+1}] [{s.get('level','?')}/{s.get('type','?')}] "
+                  f"semantic={s.get('semantic_score',0):.3f} "
+                  f"task={s.get('task_name','?')} (+{n_linked} insights)")
+
+        return selected
+
+    # -----------------------------------------------------------
+    # LLM direct top-K (E16 ablation)
+    # -----------------------------------------------------------
+    def retrieve_llm_direct(self, task_text: str, top_n: int = 20, top_k: int = 3) -> list[dict]:
+        """Semantic retrieval + LLM directly selects top-K without dimension structure.
+
+        Used by E16 (LLM direct top-K ablation): runs the same dual-score semantic
+        retrieval as the normal pipeline (Steps 1--2), then passes all N candidates
+        to the LLM WITHOUT cognitive dimension labels.
+        """
+        import json as _json
+
+        if not self.memories:
+            print("[retriever-llm-direct] No memories loaded, returning empty.")
+            return []
+
+        print(f"\n[retriever-llm-direct] Query: {task_text[:100]}...")
+
+        # Step 1: Extract cognitive profile
+        print("  [D1] Extracting cognitive query profile...")
+        query_profile = extract_cognitive_query(task_text)
+
+        cognitive_query_parts = []
+        cs = query_profile.get("causal_signature", {})
+        if cs:
+            cognitive_query_parts.append(cs.get("causal_signature", ""))
+            cognitive_query_parts.append(cs.get("error_category", ""))
+            cognitive_query_parts.append(cs.get("cause_category", ""))
+            cognitive_query_parts.append(cs.get("intervention_type", ""))
+            chain = cs.get("causal_chain", [])
+            if chain:
+                cognitive_query_parts.append(" -> ".join(chain))
+        for dim_name in ["contrastive_needs", "strategic_needs", "environment_needs"]:
+            val = query_profile.get(dim_name, "")
+            if val:
+                cognitive_query_parts.append(val)
+        cognitive_query_text = " ".join(
+            c for c in cognitive_query_parts if c and c != "other"
+        )
+
+        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        query_cog_emb = (
+            _get_embed_model().encode(cognitive_query_text).tolist()
+            if cognitive_query_text else None
+        )
+
+        # Step 2: Dual-score semantic retrieval
+        print(f"  [D2] Dual-score semantic retrieval (top {top_n})...")
+        candidates = self._semantic_retrieve(query_task_emb, query_cog_emb, top_n)
+
+        if not candidates:
+            print("  [retriever-llm-direct] No candidates, returning empty.")
+            return []
+
+        # Step 3: LLM direct selection without dimension structure
+        print(f"  [D3] LLM direct selection (flat, no dimension labels) from "
+              f"{len(candidates)} candidates...")
+
+        def _strip_dimension_label(brief: str) -> str:
+            lines = brief.split("\n")
+            if lines and lines[0].startswith("[type="):
+                return "\n".join(lines[1:])
+            return brief
+
+        candidate_briefs = []
+        for i, c in enumerate(candidates):
+            full_brief = _build_dimension_brief(c)
+            flat_brief = _strip_dimension_label(full_brief)
+            candidate_briefs.append(f"### Candidate {i}\n{flat_brief}")
+
+        candidates_text = "\n\n".join(candidate_briefs)
+
+        prompt = f"""You are selecting relevant past experiences (memories) for a coding task.
+
+## Task Query:
+{task_text[:2000]}
+
+## Candidate Memories (select the {top_k} most relevant):
+{candidates_text}
+
+## Instructions:
+From the {len(candidates)} candidates above, select the {top_k} that are MOST relevant
+to the task query.  Consider:
+- Does the memory describe a similar bug pattern, error mechanism, or fix strategy?
+- Would the knowledge in this memory help the agent solve this specific task?
+- Is the memory about the same repository/ecosystem or a transferable pattern?
+
+Output a JSON object (no markdown):
+{{"selected_indices": [idx1, idx2, idx3], "reasons": ["reason for idx1", "reason for idx2", "reason for idx3"]}}
+where indices are 0-based candidate numbers."""
+
+        try:
+            response = get_client().chat.completions.create(
+                model=get_model(),
+                messages=[
+                    {"role": "system", "content": "You are a memory relevance judge. Output only the requested JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                timeout=180.0,
+            )
+            raw = response.choices[0].message.content or ""
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+            result = _json.loads(raw)
+            selected_indices = result.get("selected_indices", [])
+        except Exception as e:
+            print(f"  [retriever-llm-direct] LLM selection failed: {e}, "
+                  f"falling back to top-{top_k} by semantic score")
+            selected_indices = list(range(min(top_k, len(candidates))))
+
+        # Gather selected memories
+        selected = []
+        for idx in selected_indices:
+            if 0 <= idx < len(candidates):
+                c = candidates[idx]
+                c["cognitive_score"] = 0.5
+                c["cognitive_dimension"] = "llm_direct"
+                c["cognitive_reason"] = "LLM direct selection (no dimension structure)"
+                selected.append(c)
+
+        # Fallback fill
+        if len(selected) < top_k:
+            for c in candidates:
+                if c not in selected:
+                    selected.append(c)
+                    c["cognitive_score"] = 0.3
+                    c["cognitive_dimension"] = "llm_direct_fallback"
+                    c["cognitive_reason"] = "Fallback fill (LLM selected too few)"
+                    if len(selected) >= top_k:
+                        break
+
+        # Attach insights
+        if self.attach_insights:
+            for mem in selected:
+                task = mem.get("task_name", "")
+                linked = self._task_to_insights.get(task, [])
+                mem["_linked_insights"] = linked
+                if linked:
+                    dims = [ins.get("type", "?") for ins in linked]
+                    print(f"    -> attached {len(linked)} insight(s) "
+                          f"[{', '.join(dims)}] from task={task}")
+
+        print(f"  [retriever-llm-direct] Selected {len(selected)} memories "
+              f"(LLM picked {len(set(selected_indices) & set(range(len(candidates))))} "
+              f"from {len(candidates)} candidates)")
+        for i, s in enumerate(selected):
+            n_linked = len(s.get("_linked_insights", []))
+            print(f"    [{i+1}] [{s.get('level','?')}/{s.get('type','?')}] "
+                  f"semantic={s.get('semantic_score',0):.3f} "
+                  f"task={s.get('task_name','?')} (+{n_linked} insights)")
 
         return selected
 

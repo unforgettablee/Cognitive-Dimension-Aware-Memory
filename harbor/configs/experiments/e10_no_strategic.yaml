@@ -1,5 +1,5 @@
-name: e11_no_trajectory
-description: 'Sequential: full system without trajectory abstraction level — workflow+summary
+name: e10_no_strategic
+description: 'Sequential: full system without strategic dimension — causal+contrastive+environment
   only'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
@@ -13,12 +13,13 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e11
-jobs_dir: jobs/sequential/e11_no_trajectory
+pool_dir: memories/sequential-pool-e10
+jobs_dir: jobs/sequential/e10_no_strategic
 only_passed: true
 derive_traditional_memory: true
-excluded_levels:
-- trajectory
+excluded_dimensions:
+- strategic
+excluded_levels: []
 agent_kwargs:
   step_limit: 150
 retrieval_config:
@@ -33,7 +34,7 @@ retrieval_config:
   retrieval:
     top_n_candidates: 20
     top_k: 3
-    min_memories: 1
+    min_memories: 0
   threshold:
     score_threshold_floor: 0.45
     score_threshold_std: 0.5

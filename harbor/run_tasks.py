@@ -327,10 +327,27 @@ def _inject_memory_context(
         score_threshold_std=threshold.get("score_threshold_std", 0.5),
         attach_insights=features.get("attach_insights", True),
         retrieval_source=features.get("retrieval_source", "cognitive"),
+        excluded_dimensions=pipeline_config.get("excluded_dimensions", []),
+        excluded_levels=pipeline_config.get("excluded_levels", []),
     )
 
     try:
-        results = retriever.retrieve(original)
+        if pipeline_config.get("use_random_retrieval"):
+            # E15: random retrieval from top-N semantic candidates
+            results = retriever.retrieve_random(
+                original,
+                top_n=retrieval.get("top_n_candidates", 20),
+                top_k=retrieval.get("top_k", 3),
+            )
+        elif pipeline_config.get("use_direct_llm_topk"):
+            # E16: LLM direct top-K selection without dimension structure
+            results = retriever.retrieve_llm_direct(
+                original,
+                top_n=retrieval.get("top_n_candidates", 20),
+                top_k=retrieval.get("top_k", 3),
+            )
+        else:
+            results = retriever.retrieve(original)
     except Exception as e:
         print(f"  WARNING: Retrieval failed: {e}")
         return None

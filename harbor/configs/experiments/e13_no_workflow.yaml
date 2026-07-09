@@ -1,5 +1,6 @@
-name: e2_no_rerank
-description: 'Sequential: dual-score retrieval + synergy, but no LLM cognitive rerank'
+name: e13_no_workflow
+description: 'Sequential: full system without workflow abstraction level — trajectory+summary
+  only'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
@@ -12,15 +13,18 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-chat
 use_memory: true
-pool_dir: memories/sequential-pool-e2
-jobs_dir: jobs/sequential/e2_no_rerank
+pool_dir: memories/sequential-pool-e13
+jobs_dir: jobs/sequential/e13_no_workflow
 only_passed: true
 derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels:
+- workflow
 agent_kwargs:
   step_limit: 150
 retrieval_config:
   features:
-    use_cognitive_rerank: false
+    use_cognitive_rerank: true
     use_llm_synergy: true
     retrieval_source: cognitive
   weights:
