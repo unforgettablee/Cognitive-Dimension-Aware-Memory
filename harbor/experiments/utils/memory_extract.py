@@ -22,11 +22,11 @@ def _get_deepseek_client() -> OpenAI:
             if _deepseek_client is None:
                 _deepseek_client = OpenAI(
                     api_key=os.getenv("API_KEY"),
-                    base_url="https://api.deepseek.com",
+                    base_url=os.getenv("BASE_URL", "https://api.deepseek.com"),
                 )
     return _deepseek_client
 
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+embed_model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
 MEMORY_LOCK_TIMEOUT = 180
 
 

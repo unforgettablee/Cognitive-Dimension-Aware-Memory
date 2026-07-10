@@ -3,7 +3,7 @@ description: Full COGENT pipeline with all features enabled — all experiences 
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
-num_tasks: null
+num_tasks: 100
 random_seed: 42
 agent: mini-swe-agent
 model: deepseek/deepseek-chat
@@ -13,7 +13,7 @@ llm:
   model: deepseek-chat
 use_memory: true
 pool_dir: memories/sequential-pool-e2
-jobs_dir: jobs/sequential/e2_full
+jobs_dir: jobs/sequential/e2_full_all_experiences
 only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []
@@ -24,6 +24,7 @@ retrieval_config:
   features:
     use_cognitive_rerank: true
     use_llm_synergy: true
+    use_synergy_selection: true
     retrieval_source: cognitive
   weights:
     alpha_dual_task: 0.7

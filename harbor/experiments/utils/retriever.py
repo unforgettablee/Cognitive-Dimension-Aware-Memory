@@ -93,6 +93,7 @@ class CognitiveRetriever:
         top_k: int = 3,
         use_cognitive_rerank: bool = True,
         use_llm_synergy: bool = True,
+        use_synergy_selection: bool = True,
         score_threshold_floor: float = 0.45,
         score_threshold_std: float = 0.5,
         min_memories: int = 1,
@@ -121,6 +122,11 @@ class CognitiveRetriever:
             use_llm_synergy: Whether to use LLM for conflict/synergy verification in
                              synergy-aware selection (Step 4). Adds ~1-3 extra LLM calls
                              but detects genuine memory conflicts and synergies.
+            use_synergy_selection: Whether to use the synergy-aware selection algorithm
+                                   at all (Step 4). When False, memories are selected by
+                                   simple top-K combined_score without any redundancy
+                                   penalty, complementarity bonus, or greedy selection.
+                                   Default True. Set False for E4 (no-synergy) ablation.
             score_threshold_floor: Absolute minimum combined_score. Memories below
                                    this are always discarded regardless of distribution.
             score_threshold_std: Multiplier for standard deviation in relative
@@ -152,6 +158,7 @@ class CognitiveRetriever:
         self.top_k = top_k
         self.use_cognitive_rerank = use_cognitive_rerank
         self.use_llm_synergy = use_llm_synergy
+        self.use_synergy_selection = use_synergy_selection
         self.score_threshold_floor = score_threshold_floor
         self.score_threshold_std = score_threshold_std
         self.min_memories = min_memories
@@ -363,6 +370,46 @@ class CognitiveRetriever:
     # -----------------------------------------------------------
     # Retrieval
     # -----------------------------------------------------------
+    def _needs_llm_cognitive_query(self) -> bool:
+        """Return True if an LLM call to extract cognitive query profile is needed.
+
+        The cognitive query serves two purposes:
+          1. Building cognitive_query_text for the cognitive embedding channel
+             (channel 2 of dual-score retrieval).  Only needed when
+             alpha_dual_task < 1.0 (i.e. cognitive channel has >0 weight).
+          2. Building query_profile for dimension-aware cognitive rerank.
+             Only needed when use_cognitive_rerank=True.
+
+        When both are false (pure embedding, MTL traditional, random), the LLM
+        call is a pure waste and can cause spurious failures.
+        """
+        # Cognitive rerank needs the profile
+        if self.use_cognitive_rerank:
+            return True
+        # Cognitive embedding channel needs the query text when it has weight
+        if self.alpha_dual_task < 1.0:
+            return True
+        return False
+
+    def _extract_cognitive_profile_safe(self, task_text: str) -> dict:
+        """Extract cognitive query profile, with fallback on failure.
+
+        Returns a dict with (possibly empty) cognitive profile.  When the
+        LLM call is not needed or fails, returns an empty/default profile
+        so retrieval can continue with task-text-only embedding similarity.
+        """
+        if not self._needs_llm_cognitive_query():
+            print("  [1/4] Cognitive query SKIPPED (embedding-only mode)")
+            return {}
+
+        print("  [1/4] Extracting cognitive query profile...")
+        try:
+            return extract_cognitive_query(task_text)
+        except Exception as e:
+            print(f"  [1/4] WARNING: cognitive query extraction failed: {e}")
+            print(f"  [1/4] Falling back to task-text-only retrieval")
+            return {}
+
     def retrieve(self, task_text: str, top_k: int | None = None) -> list[dict]:
         """Main retrieval entry point.
 
@@ -380,9 +427,8 @@ class CognitiveRetriever:
 
         print(f"\n[retriever] Query: {task_text[:100]}...")
 
-        # Step 1: Extract cognitive profile from query
-        print("  [1/4] Extracting cognitive query profile...")
-        query_profile = extract_cognitive_query(task_text)
+        # Step 1: Extract cognitive profile from query (skipped for pure-embedding mode)
+        query_profile = self._extract_cognitive_profile_safe(task_text)
 
         # Build cognitive query text from LLM-extracted profile.
         # This is the abstract cognitive signature of the query, used for
@@ -455,9 +501,15 @@ class CognitiveRetriever:
 
         candidates.sort(key=lambda c: c.get("combined_score", 0), reverse=True)
 
-        # Step 4: Synergy-aware final selection
-        print(f"  [4/4] Synergy-aware selection (top {k}, llm_synergy={self.use_llm_synergy})...")
-        selected = synergy_aware_selection(candidates, k, use_llm=self.use_llm_synergy)
+        # Step 4: Synergy-aware final selection (or simple top-K if disabled)
+        if self.use_synergy_selection:
+            print(f"  [4/4] Synergy-aware selection (top {k}, llm_synergy={self.use_llm_synergy})...")
+            selected = synergy_aware_selection(candidates, k, use_llm=self.use_llm_synergy)
+        else:
+            print(f"  [4/4] Synergy-aware selection DISABLED, using simple top-{k} by score...")
+            selected = candidates[:k]
+            for mem in selected:
+                mem["synergy_metadata"] = {"selected_by": "simple_topk"}
 
         quality = compute_selection_quality(selected)
         for mem in selected:
@@ -548,9 +600,9 @@ class CognitiveRetriever:
 
         print(f"\n[retriever-random] Query: {task_text[:100]}...")
 
-        # Step 1: Extract cognitive profile (same as normal pipeline)
+        # Step 1: Extract cognitive profile (skipped for pure-embedding mode)
         print("  [R1] Extracting cognitive query profile...")
-        query_profile = extract_cognitive_query(task_text)
+        query_profile = self._extract_cognitive_profile_safe(task_text)
 
         cognitive_query_parts = []
         cs = query_profile.get("causal_signature", {})
@@ -629,9 +681,9 @@ class CognitiveRetriever:
 
         print(f"\n[retriever-llm-direct] Query: {task_text[:100]}...")
 
-        # Step 1: Extract cognitive profile
+        # Step 1: Extract cognitive profile (skipped for pure-embedding mode)
         print("  [D1] Extracting cognitive query profile...")
-        query_profile = extract_cognitive_query(task_text)
+        query_profile = self._extract_cognitive_profile_safe(task_text)
 
         cognitive_query_parts = []
         cs = query_profile.get("causal_signature", {})
@@ -900,7 +952,7 @@ where indices are 0-based candidate numbers."""
             f"  Dimensions: {self._stats['dimensions']}",
             f"  Levels: {self._stats['levels']}",
             f"  Alpha: semantic={self.alpha_semantic} cognitive={self.alpha_cognitive} dual_task={self.alpha_dual_task}",
-            f"  Cognitive rerank: {self.use_cognitive_rerank} | LLM synergy: {self.use_llm_synergy}",
+            f"  Cognitive rerank: {self.use_cognitive_rerank} | Synergy selection: {self.use_synergy_selection} | LLM synergy: {self.use_llm_synergy}",
             f"  Threshold: floor={self.score_threshold_floor} std_mult={self.score_threshold_std} min_mem={self.min_memories}",
         ]
         return "\n".join(lines)

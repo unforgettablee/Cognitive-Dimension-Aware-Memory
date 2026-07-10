@@ -15,7 +15,7 @@ llm:
 use_memory: true
 pool_dir: memories/sequential-pool-e18
 jobs_dir: jobs/sequential/e18_no_insight
-only_passed: true
+only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []
 excluded_levels: []
@@ -25,6 +25,7 @@ retrieval_config:
   features:
     use_cognitive_rerank: true
     use_llm_synergy: true
+    use_synergy_selection: true
     attach_insights: false
     retrieval_source: cognitive
   weights:

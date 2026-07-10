@@ -38,8 +38,8 @@ def _get_deepseek_client() -> OpenAI:
         with _client_lock:
             if _deepseek_client is None:
                 _deepseek_client = OpenAI(
-                    api_key=os.getenv("DEEPSEEK_API_KEY"),
-                    base_url="https://api.deepseek.com",
+                    api_key=os.getenv("DEEPSEEK_API_KEY") or os.getenv("API_KEY"),
+                    base_url=os.getenv("BASE_URL", "https://api.deepseek.com"),
                 )
     return _deepseek_client
 

@@ -3,7 +3,7 @@ description: Full COGENT pipeline with all features enabled --- only passed-task
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
-num_tasks: null
+num_tasks: 100  # run all 500 tasks (E1 is the full-system upper bound)
 random_seed: 42
 agent: mini-swe-agent
 model: deepseek/deepseek-chat
@@ -24,6 +24,7 @@ retrieval_config:
   features:
     use_cognitive_rerank: true
     use_llm_synergy: true
+    use_synergy_selection: true
     retrieval_source: cognitive
   weights:
     alpha_dual_task: 0.7

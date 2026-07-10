@@ -15,7 +15,7 @@ llm:
 use_memory: true
 pool_dir: memories/sequential-pool-e6
 jobs_dir: jobs/sequential/e6_mtl_original
-only_passed: true
+only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []
 excluded_levels: []
@@ -25,6 +25,7 @@ retrieval_config:
   features:
     use_cognitive_rerank: false
     use_llm_synergy: false
+    use_synergy_selection: false
     retrieval_source: traditional
   weights:
     alpha_dual_task: 1.0

@@ -14,7 +14,7 @@ llm:
 use_memory: true
 pool_dir: memories/sequential-pool-e19
 jobs_dir: jobs/sequential/e19_gpt4o
-only_passed: true
+only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []
 excluded_levels: []
@@ -24,6 +24,7 @@ retrieval_config:
   features:
     use_cognitive_rerank: true
     use_llm_synergy: true
+    use_synergy_selection: true
     retrieval_source: cognitive
   weights:
     alpha_dual_task: 0.7

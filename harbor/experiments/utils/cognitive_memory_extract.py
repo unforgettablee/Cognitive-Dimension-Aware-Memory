@@ -33,11 +33,11 @@ def _get_deepseek_client() -> OpenAI:
             if _deepseek_client is None:
                 _deepseek_client = OpenAI(
                     api_key=os.getenv("API_KEY"),
-                    base_url="https://api.deepseek.com",
+                    base_url=os.getenv("BASE_URL", "https://api.deepseek.com"),
                 )
     return _deepseek_client
 
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+embed_model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
 MEMORY_LOCK_TIMEOUT = 180
 
 
@@ -132,22 +132,64 @@ def _summarize_trajectory(trajectory: list[dict]) -> dict | None:
 # Phase 2: Combined Level Extraction
 # ---------------------------------------------------------------------------
 
-def _extract_level(level: str, prompt: str, summary: dict) -> dict[str, dict]:
+# All 4 cognitive dimensions in canonical order
+_ALL_DIMENSIONS = ["causal", "contrastive", "strategic", "environment"]
+
+
+def _build_filtered_prompt(original_prompt: str, excluded_dimensions: list[str]) -> str:
+    """Remove excluded dimensions from the combined extraction prompt.
+
+    Modifies the prompt header (e.g. "4 keys" -> "3 keys") and strips the
+    ``--- dim: description ---`` sections for every excluded dimension.
+    """
+    active = [d for d in _ALL_DIMENSIONS if d not in excluded_dimensions]
+    if len(active) == len(_ALL_DIMENSIONS):
+        return original_prompt  # nothing to filter
+
+    # 1. Fix the header line: "Output JSON with 4 keys: ..."
+    import re
+    dim_list = ", ".join(f'"{d}"' for d in active)
+    prompt = re.sub(
+        r'Output JSON with \d+ keys: "[^"]+"(?:, "[^"]+")*',
+        f'Output JSON with {len(active)} keys: {dim_list}',
+        original_prompt,
+    )
+
+    # 2. Remove `--- excluded_dim: description ---` sections
+    for dim in excluded_dimensions:
+        # Match from "--- dim:" to just before the next "--- " or end of string
+        # Pattern: optional blank line + --- dim_name: ... followed by content until next ---
+        prompt = re.sub(
+            rf'\n*--- {re.escape(dim)}:.*?(?=\n--- |\n*\Z)',
+            '',
+            prompt,
+            flags=re.DOTALL,
+        )
+
+    return prompt
+
+
+def _extract_level(level: str, prompt: str, summary: dict,
+                   excluded_dimensions: list[str] | None = None) -> dict[str, dict]:
     """Run one combined extraction for a single abstraction level.
 
     Returns: {dimension_name: data_dict} for applicable dimensions only.
     """
+    excluded = [d.strip().lower() for d in (excluded_dimensions or [])]
+    filtered_prompt = _build_filtered_prompt(prompt, excluded)
+    active_dims = [d for d in _ALL_DIMENSIONS if d not in excluded]
+
     summary_text = json.dumps(summary, ensure_ascii=False, indent=2)
-    result = _call_llm(prompt,
+    result = _call_llm(filtered_prompt,
                        f"### Trajectory Summary:\n{summary_text}")
 
     if result is None:
         print(f"    [cognitive] {level}: LLM returned no valid JSON")
         return {}
 
-    # The result should have 4 keys: causal, contrastive, strategic, environment
+    # Only process dimensions that were NOT excluded
     dimensions = {}
-    for dim in ["causal", "contrastive", "strategic", "environment"]:
+    for dim in active_dims:
         dim_data = result.get(dim)
         if dim_data is None:
             # Some LLMs might return flat keys — try to find matching keys
@@ -407,8 +449,9 @@ def _derive_summary_memory(cognitive_data: dict, summary: dict,
     if judgement:
         if_pass = sum_contrastive.get("if_pass", {})
         if isinstance(if_pass, dict):
-            parts.append("Key success factors: " + "; ".join(
-                if_pass.get("key_success_factors", [])))
+            factors = [str(f) for f in if_pass.get("key_success_factors", [])]
+            if factors:
+                parts.append("Key success factors: " + "; ".join(factors))
     else:
         if_fail = sum_contrastive.get("if_fail", {})
         if isinstance(if_fail, dict):
@@ -458,10 +501,26 @@ def _derive_insight_memory(cognitive_data: dict, summary: dict,
         content_parts.append(ins_causal["principle_statement"])
     anti_patterns = ins_contrastive.get("anti_patterns", [])
     for ap in anti_patterns[:2]:
-        content_parts.append(f"Avoid: {ap.get('name', '')} — {ap.get('escape_strategy', '')}")
+        if isinstance(ap, dict):
+            content_parts.append(f"Avoid: {ap.get('name', '')} — {ap.get('escape_strategy', '')}")
+        else:
+            content_parts.append(str(ap))
     decision_rules = ins_strategic.get("decision_rules", [])
     for dr in decision_rules[:2]:
-        content_parts.append(dr)
+        if isinstance(dr, dict):
+            # LLM may return decision rules as structured dicts
+            # e.g. {"id":"DR1","condition":"...","action":"..."}
+            parts = []
+            if dr.get("condition"):
+                parts.append(f"If {dr['condition']}")
+            if dr.get("action"):
+                parts.append(f"then {dr['action']}")
+            if parts:
+                content_parts.append("; ".join(parts))
+            else:
+                content_parts.append(str(dr))
+        else:
+            content_parts.append(str(dr))
     content = " ".join(content_parts) if content_parts else title
 
     return {"title": title, "description": description, "content": content}
@@ -496,87 +555,99 @@ def _derive_traditional_memories(cognitive_data: dict, summary: dict,
     parent_dir = log_dir.rsplit("/", 1)[0]
 
     # 1. Workflow memory
-    wf_mem = _derive_workflow_memory(cognitive_data, summary, judgement, task)
-    wf_entry = {
-        "benchmark": benchmark,
-        "task_name": task_name,
-        "llm_judge": judgement,
-        "task": task,
-        "type": "workflow",
-        "workflow": wf_mem,
-        "key_embedding": _embed(wf_mem["goal"]),
-    }
-    _save_derived_memory(f"{parent_dir}/workflow_memory.pkl", wf_entry)
-    print(f"    [derive] workflow_memory saved")
+    try:
+        wf_mem = _derive_workflow_memory(cognitive_data, summary, judgement, task)
+        wf_entry = {
+            "benchmark": benchmark,
+            "task_name": task_name,
+            "llm_judge": judgement,
+            "task": task,
+            "type": "workflow",
+            "workflow": wf_mem,
+            "key_embedding": _embed(wf_mem["goal"]),
+        }
+        _save_derived_memory(f"{parent_dir}/workflow_memory.pkl", wf_entry)
+        print(f"    [derive] workflow_memory saved")
+    except Exception as e:
+        print(f"    [derive] workflow_memory FAILED: {e}")
 
     # 2. Local (traj) memory
-    local_mem = _derive_local_memory(cognitive_data, summary, judgement, task)
-    local_entry = {
-        "when_to_use": local_mem["when_to_use"],
-        "task_query": local_mem["task_query"],
-        "generalized_query": local_mem["generalized_query"],
-        "experience": local_mem["experience"],
-        "tags": local_mem["tags"],
-        "generalized_query_embedding": _embed(local_mem["generalized_query"]),
-        "benchmark": benchmark,
-        "task_name": task_name,
-        "commands": commands,
-    }
-    local_path = f"{parent_dir}/local_memory.pkl"
-    _save_derived_memory(local_path, local_entry)
-    # Also save JSON copy (matching legacy format)
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        all_local = []
-        if os.path.exists(local_path):
-            with open(local_path, "rb") as f:
-                all_local = pickle.load(f)
-        json_entries = [{
-            "when_to_use": x["when_to_use"],
-            "task_query": x["task_query"],
-            "generalized_query": x["generalized_query"],
-            "experience": x["experience"],
-            "tags": x["tags"],
-            "benchmark": x.get("benchmark", ""),
-            "task_name": x.get("task_name", ""),
-        } for x in all_local[:-1]]
-        with open(f"{log_dir}/local_memory.json", "w", encoding="utf-8") as f:
-            json.dump({"memory": {k: v for k, v in local_entry.items()
-                                  if k != "generalized_query_embedding"},
-                       "all_memory": json_entries}, f, indent=4, ensure_ascii=False)
+        local_mem = _derive_local_memory(cognitive_data, summary, judgement, task)
+        local_entry = {
+            "when_to_use": local_mem["when_to_use"],
+            "task_query": local_mem["task_query"],
+            "generalized_query": local_mem["generalized_query"],
+            "experience": local_mem["experience"],
+            "tags": local_mem["tags"],
+            "generalized_query_embedding": _embed(local_mem["generalized_query"]),
+            "benchmark": benchmark,
+            "task_name": task_name,
+            "commands": commands,
+        }
+        local_path = f"{parent_dir}/local_memory.pkl"
+        _save_derived_memory(local_path, local_entry)
+        # Also save JSON copy (matching legacy format)
+        try:
+            # log_dir is already guaranteed to exist (created in Phase 0)
+            all_local = []
+            if os.path.exists(local_path):
+                with open(local_path, "rb") as f:
+                    all_local = pickle.load(f)
+            json_entries = [{
+                "when_to_use": x["when_to_use"],
+                "task_query": x["task_query"],
+                "generalized_query": x["generalized_query"],
+                "experience": x["experience"],
+                "tags": x["tags"],
+                "benchmark": x.get("benchmark", ""),
+                "task_name": x.get("task_name", ""),
+            } for x in all_local[:-1]]
+            with open(f"{log_dir}/local_memory.json", "w", encoding="utf-8") as f:
+                json.dump({"memory": {k: v for k, v in local_entry.items()
+                                      if k != "generalized_query_embedding"},
+                           "all_memory": json_entries}, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"    [derive] local_memory.json save failed: {e}")
+        print(f"    [derive] local_memory saved")
     except Exception as e:
-        print(f"    [derive] local_memory.json save failed: {e}")
-    print(f"    [derive] local_memory saved")
+        print(f"    [derive] local_memory FAILED: {e}")
 
     # 3. Summary memory
-    sum_mem = _derive_summary_memory(cognitive_data, summary, judgement, task)
-    sum_entry = {
-        "task_summary": sum_mem["task_summary"],
-        "experience_summary": sum_mem["experience_summary"],
-        "embedding": _embed(sum_mem["task_summary"]),
-        "benchmark": benchmark,
-        "task_name": task_name,
-        "commands": commands,
-        "judgement": judgement,
-        "task": task,
-        "type": "summary",
-    }
-    _save_derived_memory(f"{parent_dir}/summary_memory_{benchmark}.pkl", sum_entry)
-    print(f"    [derive] summary_memory saved")
+    try:
+        sum_mem = _derive_summary_memory(cognitive_data, summary, judgement, task)
+        sum_entry = {
+            "task_summary": sum_mem["task_summary"],
+            "experience_summary": sum_mem["experience_summary"],
+            "embedding": _embed(sum_mem["task_summary"]),
+            "benchmark": benchmark,
+            "task_name": task_name,
+            "commands": commands,
+            "judgement": judgement,
+            "task": task,
+            "type": "summary",
+        }
+        _save_derived_memory(f"{parent_dir}/summary_memory_{benchmark}.pkl", sum_entry)
+        print(f"    [derive] summary_memory saved")
+    except Exception as e:
+        print(f"    [derive] summary_memory FAILED: {e}")
 
     # 4. Insight memory
-    ins_mem = _derive_insight_memory(cognitive_data, summary, judgement, task)
-    ins_entry = {
-        "key_embedding": _embed(ins_mem["title"]),
-        "benchmark": benchmark,
-        "type": "insight",
-        "llm_judge": judgement,
-        "task_name": task_name,
-        "task": task,
-        "insight": ins_mem,
-    }
-    _save_derived_memory(f"{parent_dir}/insight_memory.pkl", ins_entry)
-    print(f"    [derive] insight_memory saved")
+    try:
+        ins_mem = _derive_insight_memory(cognitive_data, summary, judgement, task)
+        ins_entry = {
+            "key_embedding": _embed(ins_mem["title"]),
+            "benchmark": benchmark,
+            "type": "insight",
+            "llm_judge": judgement,
+            "task_name": task_name,
+            "task": task,
+            "insight": ins_mem,
+        }
+        _save_derived_memory(f"{parent_dir}/insight_memory.pkl", ins_entry)
+        print(f"    [derive] insight_memory saved")
+    except Exception as e:
+        print(f"    [derive] insight_memory FAILED: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -585,42 +656,102 @@ def _derive_traditional_memories(cognitive_data: dict, summary: dict,
 
 def extract_cognitive_memories(judgement, trajectory, log_dir, task_name,
                                task, commands, benchmark,
-                               derive_traditional: bool = True):
+                               derive_traditional: bool = True,
+                               excluded_dimensions: list | None = None,
+                               excluded_levels: list | None = None) -> bool:
     """Extract all cognitive + traditional memories (5 LLM calls total).
 
     Flow:
+      0. Create task subdirectory (always — serves as a "task was processed" marker)
       1. Summarize trajectory (1 LLM call)
-      2. Extract 4 levels x 4 dimensions via combined prompts (4 LLM calls)
-      3. Save cognitive pkl files
+      2. Extract levels x dimensions via combined prompts (4 LLM calls normally,
+         fewer when levels are excluded)
+      3. Save cognitive pkl files (skipping excluded dimensions/levels)
       4. Derive and save traditional memories (0 LLM calls) -- only if
          derive_traditional=True (default).
 
     Args:
-        derive_traditional: If False, skip Phase 3 (traditional memory derivation).
-            Cognitive memories (4x4 matrix) are always extracted.
+        derive_traditional: If False, skip Phase 4 (traditional memory derivation).
+            Cognitive memories are always extracted (subject to excluded_* filters).
+        excluded_dimensions: Cognitive dimensions to skip entirely (e.g. ["causal"]).
+            Neither LLM extraction nor pkl saving will happen for these dimensions.
+        excluded_levels: Abstraction levels to skip entirely (e.g. ["trajectory"]).
+            The LLM call for these levels is skipped, and no memories are saved.
+
+    Returns:
+        True if at least Phase 2 (cognitive extraction) succeeded.  False means
+        the trajectory summary failed and no cognitive memories were saved.
+        (Phase 4 traditional derivation failures do NOT affect the return value —
+        they are logged but considered non-critical.)
     """
+    excluded_dim = [d.strip().lower() for d in (excluded_dimensions or [])]
+    excluded_lvl = [l.strip().lower() for l in (excluded_levels or [])]
+
+    if excluded_dim:
+        print(f"    [cognitive] Excluded dimensions: {excluded_dim}")
+    if excluded_lvl:
+        print(f"    [cognitive] Excluded levels: {excluded_lvl}")
+
     parent_dir = log_dir.rsplit("/", 1)[0]
 
+    # ---- Phase 0: Ensure task subdirectory exists ----
+    # Create early so the directory serves as a "task was processed" marker
+    # even if later phases fail.  Previously this was buried inside
+    # _derive_local_memory (Phase 4), so any Phase 2/3/4 failure silently
+    # left no trace that the task was ever processed.
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as e:
+        print(f"    [cognitive] WARNING: could not create task dir {log_dir}: {e}")
+
     # ---- Phase 1: Trajectory Summarization ----
-    print(f"    [cognitive] Phase 1/3: Summarizing trajectory...")
+    print(f"    [cognitive] Phase 1/4: Summarizing trajectory...")
     summary = _summarize_trajectory(trajectory)
     if summary is None:
-        print(f"    [cognitive] ABORT: trajectory summary failed")
-        return
+        # The LLM call failed — we cannot extract cognitive memories without a
+        # summary.  Still attempt traditional derivation with empty data
+        # (it will produce degraded but non-empty output from the raw task).
+        print(f"    [cognitive] ERROR: trajectory summary failed — "
+              f"skipping Phase 2 cognitive extraction")
+        if derive_traditional:
+            print(f"    [cognitive] Phase 4/4: Deriving traditional memories "
+                  f"(from empty cognitive data — degraded)...")
+            try:
+                _derive_traditional_memories({}, summary or {}, judgement,
+                                             log_dir, task_name, task,
+                                             commands, benchmark)
+            except Exception as e:
+                print(f"    [cognitive] WARNING: traditional memory derivation "
+                      f"failed for {task_name}: {e}")
+                import traceback
+                traceback.print_exc()
+        return False  # signal: cognitive extraction failed
 
     # ---- Phase 2: Combined Level Extraction ----
-    print(f"    [cognitive] Phase 2/3: Extracting 4 levels (combined)...")
+    active_levels = [l for l in COMBINED_MATRIX if l not in excluded_lvl]
+    n_levels = len(active_levels)
+    print(f"    [cognitive] Phase 2/4: Extracting {n_levels} levels (combined)...")
     all_cognitive_data = {}  # {level: {dimension: data}}
     count = 0
 
     for level, prompt in COMBINED_MATRIX.items():
+        if level in excluded_lvl:
+            print(f"    [cognitive]   {level}... SKIPPED (excluded level)")
+            continue
+
         print(f"    [cognitive]   {level}...")
-        dimensions = _extract_level(level, prompt, summary)
+        dimensions = _extract_level(level, prompt, summary,
+                                    excluded_dimensions=excluded_dim)
 
         if dimensions:
             all_cognitive_data[level] = dimensions
 
         for dimension, data in dimensions.items():
+            # Double-check: never save excluded dimensions (defense in depth)
+            if dimension in excluded_dim:
+                print(f"    [cognitive]   SKIP saving {level}/{dimension} (excluded)")
+                continue
+
             embedding_text = _build_embedding_text(level, dimension, data,
                                                        task_text=task)
             cognitive_text = _build_cognitive_abstract(level, dimension, data)
@@ -648,11 +779,37 @@ def extract_cognitive_memories(judgement, trajectory, log_dir, task_name,
 
     # ---- Phase 3: Derive Traditional Memories (optional) ----
     if derive_traditional:
-        print(f"    [cognitive] Phase 3/3: Deriving traditional memories...")
-        _derive_traditional_memories(all_cognitive_data, summary, judgement,
-                                     log_dir, task_name, task, commands, benchmark)
+        print(f"    [cognitive] Phase 3/4: Deriving traditional memories...")
+        try:
+            _derive_traditional_memories(all_cognitive_data, summary, judgement,
+                                         log_dir, task_name, task, commands, benchmark)
+        except Exception as e:
+            print(f"    [cognitive] WARNING: traditional memory derivation failed for "
+                  f"{task_name}: {e}")
+            import traceback
+            traceback.print_exc()
     else:
-        print(f"    [cognitive] Phase 3/3: Skipped (derive_traditional=False)")
+        print(f"    [cognitive] Phase 3/4: Skipped (derive_traditional=False)")
+
+    # Report which traditional memory types were saved (or skipped due to errors)
+    n_traditional = 0
+    traditional_types = []
+    for ttype, fname in [("workflow", "workflow_memory.pkl"),
+                          ("local", "local_memory.pkl"),
+                          ("summary", f"summary_memory_{benchmark}.pkl"),
+                          ("insight", "insight_memory.pkl")]:
+        if os.path.exists(f"{parent_dir}/{fname}"):
+            traditional_types.append(ttype)
+            n_traditional += 1
+    if derive_traditional and n_traditional < 4:
+        missing = [t for t in ["workflow", "local", "summary", "insight"]
+                   if t not in traditional_types]
+        print(f"    [cognitive] WARNING: {len(missing)} traditional memory type(s) "
+              f"not saved: {missing}")
+    elif derive_traditional:
+        print(f"    [cognitive] All 4 traditional memory types saved successfully")
+
+    return True
 
 
 # Backward compatibility alias

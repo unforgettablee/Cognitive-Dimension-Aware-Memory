@@ -14,8 +14,8 @@ llm:
   model: deepseek-chat
 use_memory: true
 pool_dir: memories/sequential-pool-e16
-jobs_dir: jobs/sequential/e16_llm_direct
-only_passed: true
+jobs_dir: jobs/sequential/e16_llm_direct_topk
+only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []
 excluded_levels: []
