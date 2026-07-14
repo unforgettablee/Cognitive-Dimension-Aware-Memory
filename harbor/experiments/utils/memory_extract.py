@@ -88,7 +88,7 @@ def _call_llm_with_json(messages: list[dict], max_retries: int = 2) -> dict:
                 "Please output ONLY the JSON object, without markdown wrapping or extra text."
             )})
         response = _get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=messages,
             timeout=300.0,
         )

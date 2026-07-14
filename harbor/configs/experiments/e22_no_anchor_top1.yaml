@@ -1,6 +1,5 @@
-name: e12_no_trajectory
-description: 'Sequential: full system without trajectory abstraction level — workflow+summary
-  only'
+name: e22_no_anchor_top1
+description: Full COGENT pipeline — no anchor in embedding (same as e21) + max 1 memory injected (top_k=1) to test whether reducing memory quantity helps avoid misleading signals
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
@@ -13,13 +12,12 @@ llm:
   api_key: ''
   base_url: https://api.deepseek.com
 use_memory: true
-pool_dir: memories/sequential-pool-e12
-jobs_dir: jobs/sequential/e12_no_trajectory
+pool_dir: memories/sequential-pool-e22
+jobs_dir: jobs/sequential/e22_no_anchor_top1
 only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []
-excluded_levels:
-- trajectory
+excluded_levels: []
 agent_kwargs:
   step_limit: 150
 retrieval_config:
@@ -28,13 +26,14 @@ retrieval_config:
     use_llm_synergy: true
     use_synergy_selection: true
     retrieval_source: cognitive
+    use_anchor_in_embedding: false
   weights:
     alpha_dual_task: 0.7
     alpha_semantic: 0.7
     alpha_cognitive: 0.3
   retrieval:
     top_n_candidates: 10
-    top_k: 3
+    top_k: 1
     min_memories: 0
   threshold:
     score_threshold_floor: 0.45

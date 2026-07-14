@@ -77,7 +77,7 @@ def extract_cognitive_query(task_text: str) -> dict:
     """Extract cognitive profile and causal signature from a query. 1 LLM call."""
     try:
         response = _get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": COGNITIVE_QUERY_PROMPT},
                 {"role": "user", "content": f"### Task:\n{task_text}"},
@@ -310,6 +310,16 @@ IMPORTANT: Each memory has a TYPE that determines HOW it should be evaluated:
   ENVIRONMENT-SPECIFIC INSIGHTS in this memory would help with the query. Is the
   repo structure, tool chain, or footgun knowledge applicable?
 
+CRITICAL: SUBSYSTEM/MODULE MISMATCH PENALTY:
+Even within the same repository, two bugs can be in COMPLETELY DIFFERENT
+subsystems.  A memory about Django ORM query composition (query.py) is NOT
+relevant to a task about Django admin filters (admin/filters.py), even though
+both mention "QuerySet" and "Django".  When scoring, explicitly CHECK whether
+the files and modules mentioned in the memory's concrete anchors are relevant
+to the query's actual bug location.  If the memory targets admin/forms but the
+query is about db/migrations, score LOW (0.0-0.2) regardless of cognitive
+pattern similarity.
+
 DIMENSION PRIORITY: The query profile specifies which cognitive dimensions are
 NEEDED for this task (need_causal / need_contrastive / need_strategic /
 need_environment). Memories in NEEDED dimensions should receive higher scores
@@ -317,10 +327,11 @@ when their content is relevant. Memories in NON-NEEDED dimensions should be
 down-weighted unless they reveal exceptionally relevant insight.
 
 Rate each memory 0-1 on its OWN dimension's relevance:
-- 0.8-1.0: Highly relevant; the cognitive insight directly applies
-- 0.5-0.7: Moderately relevant; partially applicable
-- 0.2-0.4: Weakly relevant; superficial overlap
-- 0.0-0.1: Not relevant
+- 0.8-1.0: Highly relevant; the cognitive insight directly applies AND the
+  subsystem/module context matches
+- 0.5-0.7: Moderately relevant; partially applicable, similar subsystem
+- 0.2-0.4: Weakly relevant; superficial overlap or different subsystem
+- 0.0-0.1: Not relevant; wrong subsystem or fundamentally different bug type
 
 Output a JSON object (no markdown):
 {
@@ -329,7 +340,7 @@ Output a JSON object (no markdown):
       "memory_index": 0,
       "dimension": "causal",
       "relevance_score": 0.75,
-      "reason": "One sentence explaining why this memory is or isn't relevant on its dimension"
+      "reason": "One sentence explaining why this memory is or isn't relevant on its dimension — mention subsystem match/mismatch"
     }
   ]
 }"""
@@ -377,7 +388,7 @@ def _batch_cognitive_compare(query_profile: dict, memory_briefs: list[str]) -> l
 
     try:
         response = _get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": BATCH_COGNITIVE_RERANK_PROMPT},
                 {"role": "user", "content": (

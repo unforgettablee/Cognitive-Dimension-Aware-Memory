@@ -12,11 +12,11 @@ random_seed: 42
 
 agent: "mini-swe-agent"
 model: "deepseek/deepseek-chat"
+extract_model: deepseek-chat
 
 llm:
   api_key: ""
   base_url: "https://api.deepseek.com"
-  model: "deepseek-chat"
 
 use_memory: true
 pool_dir: "memories/sequential-pool-e15"
@@ -40,6 +40,6 @@ retrieval_config:
     use_llm_synergy: false
     retrieval_source: cognitive
   retrieval:
-    top_n_candidates: 20
+    top_n_candidates: 10
     top_k: 3
-    min_memories: 1
+    min_memories: 0

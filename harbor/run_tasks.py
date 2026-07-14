@@ -170,7 +170,8 @@ def _get_judgement(trial_dir: Path) -> bool:
         if not isinstance(result, dict):
             return False
         verifier = result.get("verifier_result") or {}
-        reward = (verifier or {}).get("rewards", {}).get("reward", 0.0)
+        rewards = (verifier or {}).get("rewards") or {}
+        reward = rewards.get("reward", 0.0)
         return reward >= 1.0
     # Fallback: verifier/reward.txt
     reward_path = trial_dir / "verifier" / "reward.txt"
@@ -206,6 +207,7 @@ def _extract_memories_for_task(
     start_index: int = 0,
     excluded_dimensions: list | None = None,
     excluded_levels: list | None = None,
+    use_anchor_in_embedding: bool = True,
     pipeline_config: dict | None = None,
 ) -> bool:
     """Extract memories from a completed task's trial directory into the pool.
@@ -225,19 +227,13 @@ def _extract_memories_for_task(
         print(f"  WARNING: No trial directory found for {task_name} in {jobs_dir}")
         return False
 
-    # Always extract memories — even FAIL tasks contain partial trajectory
-    # data that can be mined for anti-patterns, failure modes, and
-    # environment knowledge.  The ``only_passed`` config still controls
-    # whether FAIL-task memories are injected into *subsequent* tasks'
-    # prompts (via the retrieval pool), but all tasks contribute to the
-    # indexed pool so downstream experiments can filter.
+    # Check if we should skip based on pass/fail
     judgement = _get_judgement(trial_dir)
     status = "PASS" if judgement else "FAIL"
 
     if only_passed and not judgement:
-        print(f"  Task {status}: only_passed=True would normally skip extraction, "
-              f"but extracting anyway (partial trajectory still has value).")
-        # NOTE: we still extract — the flag is informational only.
+        print(f"  SKIP extraction: task {status}, only_passed=True")
+        return False
 
     extract_script = str(Path(__file__).resolve().parent / "extract_memories.py")
     cmd = [
@@ -253,6 +249,8 @@ def _extract_memories_for_task(
         cmd.extend(["--excluded-dimensions"] + list(excluded_dimensions))
     if excluded_levels:
         cmd.extend(["--excluded-levels"] + list(excluded_levels))
+    if not use_anchor_in_embedding:
+        cmd.append("--no-anchor-in-embedding")
 
     env = os.environ.copy()
     env.setdefault("HF_HUB_OFFLINE", "1")
@@ -782,6 +780,7 @@ def _inject_memory_context(
         retrieval_source=features.get("retrieval_source", "cognitive"),
         excluded_dimensions=pipeline_config.get("excluded_dimensions", []),
         excluded_levels=pipeline_config.get("excluded_levels", []),
+        use_anchor_in_query_embedding=features.get("use_anchor_in_embedding", True),
     )
 
     try:
@@ -962,8 +961,47 @@ def _write_result_json_incremental(
         print(f"  [result.json] updated ({progress} passed, mean={mean:.3f})")
 
 
+def _stage_task_dir(src: Path, dst: Path) -> None:
+    """Copy *src* task directory to *dst* using hard links when possible.
+
+    Hard links make the copy essentially free (no extra disk space) for
+    most files.  **instruction.md** is always deep-copied so that writing
+    to the staging copy does NOT write through to the original (hard
+    links share the same inode; a ``write_text`` would modify both).
+
+    Falls back to a full copy when *src* and *dst* are on different
+    filesystems (hard links require the same filesystem).
+    """
+    import errno
+
+    if dst.exists():
+        return  # already staged (e.g. from a previous re-run of the same task)
+
+    def _link_or_copy(src_path: str, dst_path: str, *, follow_symlinks: bool = True):
+        # instruction.md must be a REAL copy — hard-linking it would mean
+        # writing to the staging copy also modifies the original.
+        if os.path.basename(src_path) == "instruction.md":
+            shutil.copy2(src_path, dst_path, follow_symlinks=follow_symlinks)
+            return
+        try:
+            os.link(src_path, dst_path, follow_symlinks=follow_symlinks)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                # Cross-filesystem -- fall back to real copy
+                shutil.copy2(src_path, dst_path, follow_symlinks=follow_symlinks)
+            else:
+                raise
+
+    shutil.copytree(src, dst, copy_function=_link_or_copy, dirs_exist_ok=False)
+
+
 def _restore_instruction(task_dir: Path, original: str | None):
-    """Restore the original instruction.md after harbor completes."""
+    """Restore the original instruction.md after harbor completes.
+
+    .. deprecated::
+        With per-experiment task staging (see ``_stage_task_dir``) this is
+        no longer called.  The original ``instruction.md`` is never touched.
+    """
     if original is None:
         return
     instruction_path = task_dir / "instruction.md"
@@ -1032,12 +1070,34 @@ def _run_sequential_pipeline(
 
     only_passed = pipeline_config.get("only_passed", True)
     derive_traditional = pipeline_config.get("derive_traditional_memory", True)
+    # use_anchor_in_embedding: controls whether concrete file paths, function
+    # names, and test commands are included in the key_embedding vector during
+    # memory extraction.  Default True.  Set False (via retrieval_config.features
+    # or top-level) to reduce same-repo vocabulary bias.
+    features_cfg = (pipeline_config.get("retrieval_config") or {}).get("features", {}) or {}
+    use_anchor_in_embedding = (
+        pipeline_config.get("use_anchor_in_embedding")
+        if "use_anchor_in_embedding" in pipeline_config
+        else features_cfg.get("use_anchor_in_embedding", True)
+    )
     excluded_dimensions = pipeline_config.get("excluded_dimensions") or []
     excluded_levels = pipeline_config.get("excluded_levels") or []
     python_exe = _find_python_exe() if enable_memory else None
     jobs_dir_path = Path(jobs_dir)
     tasks_dir_path = Path(tasks_dir)
     eval_key = _build_eval_key(pipeline_config, agent, model)
+
+    # ---- Per-experiment task staging (memory pipelines only) ----
+    # When enable_memory=True, each experiment gets its own staging copy of
+    # task directories so that concurrent experiments do NOT overwrite each
+    # other's instruction.md injections.  Hard links are used for speed;
+    # modifying instruction.md automatically breaks the link and creates an
+    # experiment-private inode.
+    _staging_tasks_dir: Path | None = None
+    if enable_memory:
+        _staging_tasks_dir = run_job_dir / "task-staging"
+        _staging_tasks_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Task staging: {_staging_tasks_dir}")
 
     print(f"  Run dir:      {run_job_dir}")
     if enable_memory:
@@ -1053,12 +1113,20 @@ def _run_sequential_pipeline(
     started_at_iso = datetime.now().isoformat()
     results: list[dict] = []
 
-    def _build_harbor_cmd(task_name: str) -> list[str]:
-        """Build a harbor jobs start command for a single task."""
+    def _build_harbor_cmd(task_name: str,
+                          effective_tasks_dir: Path | None = None) -> list[str]:
+        """Build a harbor jobs start command for a single task.
+
+        When *effective_tasks_dir* is provided, it is used as the ``-p``
+        argument instead of the shared *tasks_dir*.  This allows per-
+        experiment staging directories so that concurrent experiments
+        do not corrupt each other's instruction.md injections.
+        """
         cmd = [harbor_exe, "-m", "harbor.cli.main", "jobs", "start"]
 
+        _td = effective_tasks_dir or tasks_dir
         cmd.extend([
-            "-p", str(tasks_dir),
+            "-p", str(_td),
             "-a", agent,
             "-m", model,
             "--jobs-dir", jobs_dir,
@@ -1103,18 +1171,30 @@ def _run_sequential_pipeline(
 
         # ---- Step 0: Retrieve & inject memory context (memory pipelines only) ----
         task_dir = tasks_dir_path / task_name
-        original_instruction = None
+        effective_tasks_dir = tasks_dir_path  # default: use shared original
         if has_pool:
             print(f"  [0/3] Retrieving relevant memories...")
-            original_instruction = _inject_memory_context(
-                task_dir, pool_dir, pipeline_config,
-            )
+            if _staging_tasks_dir is not None:
+                # Isolated staging copy --- concurrent experiments do NOT
+                # overwrite each other's instruction.md injections.
+                staging_task_dir = _staging_tasks_dir / task_name
+                _stage_task_dir(task_dir, staging_task_dir)
+                _inject_memory_context(
+                    staging_task_dir, pool_dir, pipeline_config,
+                )
+                effective_tasks_dir = _staging_tasks_dir
+            else:
+                # Legacy path (memory enabled but no staging dir --
+                # should not normally happen, kept for safety).
+                _inject_memory_context(
+                    task_dir, pool_dir, pipeline_config,
+                )
 
         # ---- Step 1: Run harbor for this single task ----
         jobs_dir_path.mkdir(parents=True, exist_ok=True)
         before_dirs = set(d.name for d in jobs_dir_path.iterdir() if d.is_dir())
 
-        cmd = _build_harbor_cmd(task_name)
+        cmd = _build_harbor_cmd(task_name, effective_tasks_dir=effective_tasks_dir)
 
         print(f"  [1/3] Running agent...")
         print(f"  Command: {' '.join(cmd[:5])} ... -i {task_name}")
@@ -1131,8 +1211,8 @@ def _run_sequential_pipeline(
             print(f"  WARNING: harbor subprocess failed: {exc}")
             harbor_error_type = type(exc).__name__
 
-        # Restore original instruction.md
-        _restore_instruction(task_dir, original_instruction)
+        # Staging copies are experiment-private and do NOT need restore.
+        # (The original instruction.md was never touched.)
 
         # Identify harbor's newly created timestamp directory
         after_dirs = set(d.name for d in jobs_dir_path.iterdir() if d.is_dir())
@@ -1187,6 +1267,7 @@ def _run_sequential_pipeline(
                 python_exe=python_exe,
                 start_index=extraction_start,
                 excluded_dimensions=excluded_dimensions,
+                use_anchor_in_embedding=use_anchor_in_embedding,
                 pipeline_config=pipeline_config,
                 excluded_levels=excluded_levels,
             )
@@ -1215,7 +1296,7 @@ def _run_sequential_pipeline(
             if trial_result_path.exists():
                 try:
                     tr = json.loads(trial_result_path.read_text(encoding="utf-8"))
-                    ar = tr.get("agent_result", {})
+                    ar = tr.get("agent_result") or {}
                     n_input_tokens = ar.get("n_input_tokens") or 0
                     n_cache_tokens = ar.get("n_cache_tokens") or 0
                     n_output_tokens = ar.get("n_output_tokens") or 0
@@ -1271,6 +1352,11 @@ def _run_sequential_pipeline(
     if enable_memory and pool_dir:
         print(f"  Memory pool: {_count_pool_tasks(pool_dir)} tasks contributed")
     print(f"{'=' * 70}")
+
+    # ---- Clean up experiment-private task staging directory ----
+    if _staging_tasks_dir is not None and _staging_tasks_dir.exists():
+        shutil.rmtree(str(_staging_tasks_dir), ignore_errors=True)
+        print(f"  [cleanup] Removed task staging dir: {_staging_tasks_dir}")
 
     finished_at_iso = datetime.now().isoformat()
 
@@ -1391,6 +1477,15 @@ def main():
              "Useful when you only want retrieval from a pre-built pool.",
     )
 
+    # ---- Memory LLM model ----
+    parser.add_argument(
+        "--extract-model", default=None,
+        help="Model used for memory extraction & retrieval LLM calls "
+             "(e.g. 'deepseek-v4-pro').  Defaults to the pipeline config's "
+             "'extract_model' field, then DEEPSEEK_MODEL env, then 'deepseek-chat'.  "
+             "Independent of the agent's --model.",
+    )
+
     # ---- Misc ----
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -1442,6 +1537,35 @@ def main():
     # Resolve: agent
     # =====================================================================
     agent = args.agent or pipeline_config.get("agent") or "mini-swe-agent"
+
+    # =====================================================================
+    # Resolve: extract_model (for memory extraction & retrieval LLM calls)
+    # =====================================================================
+    if args.extract_model:
+        extract_model = args.extract_model
+        extract_model_source = "CLI"
+    else:
+        env_extract = os.environ.get("EXTRACT_MODEL", "")
+        if env_extract:
+            extract_model = env_extract
+            extract_model_source = "EXTRACT_MODEL env"
+        elif pipeline_config.get("extract_model"):
+            extract_model = pipeline_config["extract_model"]
+            extract_model_source = "pipeline"
+        else:
+            # Fall back to DEEPSEEK_MODEL, then MODEL, then hard-coded default
+            extract_model = (
+                os.environ.get("DEEPSEEK_MODEL")
+                or os.environ.get("MODEL", "")
+                or "deepseek-chat"
+            )
+            extract_model_source = "DEEPSEEK_MODEL/MODEL env fallback" if (
+                os.environ.get("DEEPSEEK_MODEL") or os.environ.get("MODEL")
+            ) else "default"
+    # Propagate to subprocesses via environment variable so downstream
+    # scripts (extract_memories.py, cognitive_rerank.py, synergy.py,
+    # retriever.py) pick it up via os.getenv("DEEPSEEK_MODEL").
+    os.environ["DEEPSEEK_MODEL"] = extract_model
 
     # =====================================================================
     # Resolve: jobs-dir
@@ -1569,6 +1693,8 @@ def main():
     print()
     print("─" * 60)
     print(f"  Model:       {model}  (from {model_source})")
+    if use_memory:
+        print(f"  Extract LLM: {extract_model}  (from {extract_model_source})")
     print(f"  Agent:       {agent}")
     print(f"  Jobs dir:    {jobs_dir}  (from {jobs_source})")
     print(f"  Memory:      {'YES' if use_memory else 'NO'}"

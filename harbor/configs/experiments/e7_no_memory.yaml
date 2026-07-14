@@ -6,16 +6,16 @@ description: "Sequential baseline: no memory retrieval, tasks run independently"
 tasks_dir: "harbor-tasks/swebench-verified"
 start_index: 0
 end_index: 500
-num_tasks: null
+num_tasks: 100
 random_seed: 42
 
 agent: "mini-swe-agent"
 model: "deepseek/deepseek-chat"
+extract_model: deepseek-chat
 
 llm:
   api_key: ""
   base_url: "https://api.deepseek.com"
-  model: "deepseek-chat"
 
 use_memory: false
 pool_dir: ""

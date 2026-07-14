@@ -8,10 +8,10 @@ num_tasks: 100
 random_seed: 42
 agent: mini-swe-agent
 model: deepseek/deepseek-chat
+extract_model: deepseek-chat
 llm:
   api_key: ''
   base_url: https://api.deepseek.com
-  model: deepseek-chat
 use_memory: true
 pool_dir: memories/sequential-pool-e6
 jobs_dir: jobs/sequential/e6_mtl_original

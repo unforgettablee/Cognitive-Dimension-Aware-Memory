@@ -8,10 +8,10 @@ num_tasks: 100
 random_seed: 42
 agent: mini-swe-agent
 model: deepseek/deepseek-chat
+extract_model: deepseek-chat
 llm:
   api_key: ''
   base_url: https://api.deepseek.com
-  model: deepseek-chat
 use_memory: true
 pool_dir: memories/sequential-pool-e13
 jobs_dir: jobs/sequential/e13_no_workflow
@@ -30,10 +30,10 @@ retrieval_config:
     retrieval_source: cognitive
   weights:
     alpha_dual_task: 0.7
-    alpha_semantic: 0.35
-    alpha_cognitive: 0.65
+    alpha_semantic: 0.7
+    alpha_cognitive: 0.3
   retrieval:
-    top_n_candidates: 20
+    top_n_candidates: 10
     top_k: 3
     min_memories: 0
   threshold:

@@ -72,6 +72,46 @@ def _get_embed_model():
     return _embed_model
 
 
+# Patterns to strip from query task text when use_anchor_in_query_embedding=False.
+# These capture repository-specific concrete anchors (file paths, shell commands,
+# test invocations) that would create false-positive embedding matches across
+# same-repo memories regardless of actual bug relevance.
+import re as _re
+
+_CONCRETE_ANCHOR_PATTERNS: list[tuple[str, str]] = [
+    # File paths: django/db/models/query.py, /testbed/django/..., etc.
+    (r'\b[\w.-]+(?:/[\w.-]+)+\.py\b', ' '),
+    # Python module paths in docstrings/code: django.db.models.query
+    (r'\b[\w]+(?:\.[\w]+){2,}\b', ' '),
+    # Shell commands: cd /testbed && python tests/runtests.py ...
+    (r'(?:cd |python[23]? |pip |git |docker |conda |grep |find |cat |ls |sed |awk |nl |xargs |bash )'
+     r'\S+(?:\s+\S+){0,15}', ' '),
+    # Test runner invocations
+    (r'python (?:-m )?(?:tests\.runtests|pytest|manage\.py test)\S*(?:\s+\S+){0,10}', ' '),
+    # Git SHAs / commit hashes
+    (r'\b[0-9a-f]{7,40}\b', ' '),
+    # URL references to specific GitHub lines
+    (r'https?://github\.com/\S+', ' '),
+]
+_CONCRETE_REPLACEMENTS = [(_re.compile(p), r) for p, r in _CONCRETE_ANCHOR_PATTERNS]
+
+
+def _strip_concrete_terms_for_query(task_text: str) -> str:
+    """Remove repository-specific concrete anchors from query task text.
+
+    When ``use_anchor_in_query_embedding=False``, the query embedding should
+    inhabit the same vocabulary space as the anchor-free memory key_embeddings.
+    This function strips file paths, shell commands, test invocations, and
+    other concrete terms that carry no abstract cognitive signal.
+    """
+    text = task_text
+    for pattern, replacement in _CONCRETE_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    # Collapse whitespace
+    text = _re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 class CognitiveRetriever:
     """Unified retrieval with dimension-aware cognitive rerank + synergy."""
 
@@ -101,6 +141,7 @@ class CognitiveRetriever:
         retrieval_source: str = "cognitive",
         excluded_dimensions: list | None = None,
         excluded_levels: list | None = None,
+        use_anchor_in_query_embedding: bool = True,
     ):
         """
         Args:
@@ -149,6 +190,13 @@ class CognitiveRetriever:
             excluded_levels: Abstraction levels to EXCLUDE from retrieval pool.
                              Entries whose level matches are filtered after loading.
                              For abstraction tier leave-one-out ablation (e11--e13).
+            use_anchor_in_query_embedding: If False, strip concrete file paths,
+                function names, and repository-specific vocabulary from the
+                query task text BEFORE computing query_task_emb (channel 1 of
+                dual-score retrieval).  Must match the corresponding
+                ``use_anchor_in_embedding`` setting used during memory
+                extraction so that query and memory vectors inhabit the same
+                vocabulary space.  Default True.
         """
         self.memory_dir = Path(memory_dir)
         self.alpha_semantic = alpha_semantic
@@ -166,6 +214,7 @@ class CognitiveRetriever:
         self.retrieval_source = retrieval_source
         self.excluded_dimensions = [d.strip().lower() for d in (excluded_dimensions or [])]
         self.excluded_levels = [l.strip().lower() for l in (excluded_levels or [])]
+        self.use_anchor_in_query_embedding = use_anchor_in_query_embedding
 
         self.memories: list[dict] = []
         self._embeddings: np.ndarray | None = None
@@ -231,9 +280,21 @@ class CognitiveRetriever:
             if _matches_source(p.name)
         )
         if not pkl_files:
-            raise FileNotFoundError(
-                f"No '{self.retrieval_source}' .pkl files found in {self.memory_dir}"
-            )
+            # No files matched the requested source filter.  Try falling
+            # back to whatever .pkl files ARE present so the experiment
+            # doesn't crash just because the pool was populated by a
+            # different extraction configuration.
+            fallback_files = sorted(self.memory_dir.glob("*.pkl"))
+            if fallback_files:
+                print(f"[retriever] WARNING: no '{self.retrieval_source}' .pkl files "
+                      f"found, falling back to all available pkl files "
+                      f"({[p.name for p in fallback_files]})")
+                pkl_files = fallback_files
+                self.retrieval_source = "all"  # disable source filter for this session
+            else:
+                raise FileNotFoundError(
+                    f"No .pkl files found in {self.memory_dir}"
+                )
 
         print(f"[retriever] Loading {len(pkl_files)} memory files "
               f"(source={self.retrieval_source}) from {self.memory_dir}")
@@ -303,11 +364,15 @@ class CognitiveRetriever:
             else:
                 concrete_entries.append(entry)
 
-        # Build task -> insights index
+        # Build task+type -> insights index (for dimension-matched attachment)
         for entry in insight_entries:
             task = entry.get("task_name", "")
+            dim = entry.get("type", "")
             if task:
-                self._task_to_insights.setdefault(task, []).append(entry)
+                # Key by (task, type) so each concrete memory gets only
+                # insights from the same cognitive dimension
+                key = (task, dim)
+                self._task_to_insights.setdefault(key, []).append(entry)
 
         # Build task -> concrete index (for optional extended linkage)
         for entry in concrete_entries:
@@ -355,7 +420,7 @@ class CognitiveRetriever:
             "total_memories": len(all_entries),
             "retrieval_pool": len(concrete_entries),
             "insight_attached": len(insight_entries),
-            "tasks_with_insights": len(self._task_to_insights),
+            "tasks_with_insights": len(set(k[0] for k in self._task_to_insights.keys())),
             "total_files": len(pkl_files),
             "dimensions": list(set(m.get("type", "") for m in self.memories)),
             "levels": list(set(m.get("level", "") for m in self.memories)),
@@ -454,7 +519,17 @@ class CognitiveRetriever:
         #   Channel 2 (cognitive): pure cognitive text -> matches memory.cognitive_embedding
         # This separation prevents the concrete task text from drowning out the
         # cognitive signal in the embedding vector, enabling cross-repo pattern matching.
-        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        #
+        # When use_anchor_in_query_embedding=False (e21+), strip concrete file
+        # paths, shell commands, and test invocations from the query task text
+        # so that query and memory key_embedding vectors inhabit the same
+        # vocabulary space.
+        _task_text_for_emb = (
+            _strip_concrete_terms_for_query(task_text)
+            if not self.use_anchor_in_query_embedding
+            else task_text
+        )
+        query_task_emb = _get_embed_model().encode(_task_text_for_emb).tolist()
         query_cog_emb = _get_embed_model().encode(cognitive_query_text).tolist() if cognitive_query_text else None
 
         # Step 2: Dual-score semantic retrieval
@@ -556,12 +631,14 @@ class CognitiveRetriever:
         if self.attach_insights:
             for mem in selected:
                 task = mem.get("task_name", "")
-                linked = self._task_to_insights.get(task, [])
+                dim = mem.get("type", "")
+                key = (task, dim)
+                linked = self._task_to_insights.get(key, [])
                 mem["_linked_insights"] = linked
                 if linked:
-                    dims = [ins.get("type", "?") for ins in linked]
-                    print(f"    -> attached {len(linked)} insight(s) [{', '.join(dims)}] "
-                          f"from task={task}")
+                    ins_dims = [ins.get("type", "?") for ins in linked]
+                    print(f"    -> attached {len(linked)} insight(s) [{', '.join(ins_dims)}] "
+                          f"from task={task}  (dimension-matched: {dim})")
         else:
             print(f"  [retriever] Insight attachment DISABLED (attach_insights=False)")
 
@@ -622,7 +699,12 @@ class CognitiveRetriever:
             c for c in cognitive_query_parts if c and c != "other"
         )
 
-        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        _task_text_for_emb = (
+            _strip_concrete_terms_for_query(task_text)
+            if not self.use_anchor_in_query_embedding
+            else task_text
+        )
+        query_task_emb = _get_embed_model().encode(_task_text_for_emb).tolist()
         query_cog_emb = (
             _get_embed_model().encode(cognitive_query_text).tolist()
             if cognitive_query_text else None
@@ -637,16 +719,18 @@ class CognitiveRetriever:
         n_pick = min(top_k, len(candidates))
         selected = rng.sample(candidates, n_pick) if n_pick > 0 else []
 
-        # Attach insights (respect the attach_insights flag)
+        # Attach insights (respect the attach_insights flag, dimension-matched)
         if self.attach_insights:
             for mem in selected:
                 task = mem.get("task_name", "")
-                linked = self._task_to_insights.get(task, [])
+                dim = mem.get("type", "")
+                key = (task, dim)
+                linked = self._task_to_insights.get(key, [])
                 mem["_linked_insights"] = linked
                 if linked:
-                    dims = [ins.get("type", "?") for ins in linked]
-                    print(f"    -> attached {len(linked)} insight(s) [{', '.join(dims)}] "
-                          f"from task={task}")
+                    ins_dims = [ins.get("type", "?") for ins in linked]
+                    print(f"    -> attached {len(linked)} insight(s) [{', '.join(ins_dims)}] "
+                          f"from task={task}  (dimension-matched: {dim})")
 
         print(f"  [retriever-random] Selected {len(selected)} memories "
               f"(random from top-{len(candidates)} semantic candidates)")
@@ -703,7 +787,12 @@ class CognitiveRetriever:
             c for c in cognitive_query_parts if c and c != "other"
         )
 
-        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        _task_text_for_emb = (
+            _strip_concrete_terms_for_query(task_text)
+            if not self.use_anchor_in_query_embedding
+            else task_text
+        )
+        query_task_emb = _get_embed_model().encode(_task_text_for_emb).tolist()
         query_cog_emb = (
             _get_embed_model().encode(cognitive_query_text).tolist()
             if cognitive_query_text else None
@@ -801,16 +890,18 @@ where indices are 0-based candidate numbers."""
                     if len(selected) >= top_k:
                         break
 
-        # Attach insights
+        # Attach insights (dimension-matched)
         if self.attach_insights:
             for mem in selected:
                 task = mem.get("task_name", "")
-                linked = self._task_to_insights.get(task, [])
+                dim = mem.get("type", "")
+                key = (task, dim)
+                linked = self._task_to_insights.get(key, [])
                 mem["_linked_insights"] = linked
                 if linked:
-                    dims = [ins.get("type", "?") for ins in linked]
+                    ins_dims = [ins.get("type", "?") for ins in linked]
                     print(f"    -> attached {len(linked)} insight(s) "
-                          f"[{', '.join(dims)}] from task={task}")
+                          f"[{', '.join(ins_dims)}] from task={task}  (dimension-matched: {dim})")
 
         print(f"  [retriever-llm-direct] Selected {len(selected)} memories "
               f"(LLM picked {len(set(selected_indices) & set(range(len(candidates))))} "

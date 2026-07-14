@@ -192,7 +192,7 @@ def detect_conflict_llm(mem_a: dict, mem_b: dict) -> dict:
     preview_b = _build_memory_preview(mem_b)
     try:
         response = _get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": CONFLICT_CHECK_PROMPT},
                 {"role": "user", "content": (
@@ -219,7 +219,7 @@ def detect_synergy_llm(mem_a: dict, mem_b: dict) -> dict:
     preview_b = _build_memory_preview(mem_b)
     try:
         response = _get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": SYNERGY_CHECK_PROMPT},
                 {"role": "user", "content": (

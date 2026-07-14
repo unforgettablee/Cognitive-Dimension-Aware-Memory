@@ -91,7 +91,7 @@ def _call_llm(system_prompt: str, user_content: str, max_retries: int = 2) -> di
             )})
         try:
             response = _get_deepseek_client().chat.completions.create(
-                model="deepseek-chat",
+                model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
                 messages=messages,
                 timeout=300.0,
             )
@@ -273,38 +273,48 @@ def _build_cognitive_abstract(level: str, dimension: str, data: dict) -> str:
 
 
 def _build_embedding_text(level: str, dimension: str, data: dict,
-                          task_text: str = "") -> str:
+                          task_text: str = "",
+                          use_anchor_in_embedding: bool = True) -> str:
     """Build HYBRID embedding text: original task + cognitive abstract + anchors.
 
     Puts BOTH concrete task description AND cognitive abstract into the same
-    embedding vector so queries can match on task-level or cognitive-level similarity.
+    embedding vector so queries can match on task-level or cognitive-level
+    similarity.
+
+    When *use_anchor_in_embedding* is False, concrete file paths, function
+    names and test commands are EXCLUDED from the embedding vector.  This
+    reduces same-repo vocabulary bias (e.g. ``django/db/models/query.py``
+    matching every Django memory regardless of bug subsystem).  Only
+    cognitive abstract and task text participate in similarity matching.
     """
     cognitive_abstract = _build_cognitive_abstract(level, dimension, data)
 
-    anchors = data.get("concrete_anchors", {}) or data.get("concrete_origin", {}) or {}
+    # Concrete anchors (file paths, functions, tests, etc.)
     anchor_parts = []
-    for key in ["files_involved", "files_modified", "key_files_paths"]:
-        vals = anchors.get(key, [])
-        if vals:
-            anchor_parts.append("Files: " + ", ".join(str(v) for v in vals[:5]))
-            break
-    for key in ["key_functions"]:
-        vals = anchors.get(key, [])
-        if vals:
-            anchor_parts.append("Functions: " + ", ".join(str(v) for v in vals[:5]))
-    for key in ["error_pattern", "error_signature", "fix_pattern"]:
-        val = anchors.get(key, "")
-        if val:
-            anchor_parts.append(str(key) + ": " + str(val)[:200])
-    for key in ["test_command", "build_command"]:
-        val = anchors.get(key, "")
-        if val:
-            anchor_parts.append(str(key) + ": " + str(val)[:200])
-    for key in ["source_file", "source_example", "anti_pattern_file",
-                "positive_pattern_code", "methodology_in_action"]:
-        val = anchors.get(key, "")
-        if val:
-            anchor_parts.append(str(key) + ": " + str(val)[:200])
+    if use_anchor_in_embedding:
+        anchors = data.get("concrete_anchors", {}) or data.get("concrete_origin", {}) or {}
+        for key in ["files_involved", "files_modified", "key_files_paths"]:
+            vals = anchors.get(key, [])
+            if vals:
+                anchor_parts.append("Files: " + ", ".join(str(v) for v in vals[:5]))
+                break
+        for key in ["key_functions"]:
+            vals = anchors.get(key, [])
+            if vals:
+                anchor_parts.append("Functions: " + ", ".join(str(v) for v in vals[:5]))
+        for key in ["error_pattern", "error_signature", "fix_pattern"]:
+            val = anchors.get(key, "")
+            if val:
+                anchor_parts.append(str(key) + ": " + str(val)[:200])
+        for key in ["test_command", "build_command"]:
+            val = anchors.get(key, "")
+            if val:
+                anchor_parts.append(str(key) + ": " + str(val)[:200])
+        for key in ["source_file", "source_example", "anti_pattern_file",
+                    "positive_pattern_code", "methodology_in_action"]:
+            val = anchors.get(key, "")
+            if val:
+                anchor_parts.append(str(key) + ": " + str(val)[:200])
     anchor_text = " ".join(anchor_parts)
 
     parts = []
@@ -323,13 +333,24 @@ def _build_embedding_text(level: str, dimension: str, data: dict,
 # ---------------------------------------------------------------------------
 
 def _save_pkl(memory_path: str, new_entry: dict):
+    """Save a cognitive memory entry to a pkl file.
+
+    If the existing file is corrupted (e.g. from a previous crash during
+    write), it is silently replaced with a fresh file containing only the
+    new entry.
+    """
     lock_path = memory_path + ".lock"
     try:
         with FileLock(lock_path, timeout=MEMORY_LOCK_TIMEOUT):
             all_memory = []
             if os.path.exists(memory_path):
-                with open(memory_path, "rb") as f:
-                    all_memory = pickle.load(f)
+                try:
+                    with open(memory_path, "rb") as f:
+                        all_memory = pickle.load(f)
+                except Exception:
+                    print(f"    [cognitive] WARNING: {os.path.basename(memory_path)} "
+                          f"is corrupted, rebuilding from scratch")
+                    all_memory = []
             all_memory.append(new_entry)
             with open(memory_path, "wb") as f:
                 pickle.dump(all_memory, f)
@@ -527,14 +548,24 @@ def _derive_insight_memory(cognitive_data: dict, summary: dict,
 
 
 def _save_derived_memory(memory_path: str, entry: dict):
-    """Save a derived traditional memory entry to a pkl file."""
+    """Save a derived traditional memory entry to a pkl file.
+
+    If the existing file is corrupted (e.g. from a previous crash during
+    write), it is silently replaced with a fresh file containing only the
+    new entry rather than letting the exception propagate.
+    """
     lock_path = memory_path + ".lock"
     try:
         with FileLock(lock_path, timeout=MEMORY_LOCK_TIMEOUT):
             all_memory = []
             if os.path.exists(memory_path):
-                with open(memory_path, "rb") as f:
-                    all_memory = pickle.load(f)
+                try:
+                    with open(memory_path, "rb") as f:
+                        all_memory = pickle.load(f)
+                except Exception:
+                    print(f"    [derive] WARNING: {os.path.basename(memory_path)} "
+                          f"is corrupted, rebuilding from scratch")
+                    all_memory = []
             all_memory.append(entry)
             with open(memory_path, "wb") as f:
                 pickle.dump(all_memory, f)
@@ -658,7 +689,8 @@ def extract_cognitive_memories(judgement, trajectory, log_dir, task_name,
                                task, commands, benchmark,
                                derive_traditional: bool = True,
                                excluded_dimensions: list | None = None,
-                               excluded_levels: list | None = None) -> bool:
+                               excluded_levels: list | None = None,
+                               use_anchor_in_embedding: bool = True) -> bool:
     """Extract all cognitive + traditional memories (5 LLM calls total).
 
     Flow:
@@ -677,6 +709,10 @@ def extract_cognitive_memories(judgement, trajectory, log_dir, task_name,
             Neither LLM extraction nor pkl saving will happen for these dimensions.
         excluded_levels: Abstraction levels to skip entirely (e.g. ["trajectory"]).
             The LLM call for these levels is skipped, and no memories are saved.
+        use_anchor_in_embedding: If False, exclude concrete file paths, function
+            names, and test commands from the key_embedding vector.  This reduces
+            same-repo vocabulary bias in semantic retrieval at the cost of weaker
+            concrete matching.  Default True.
 
     Returns:
         True if at least Phase 2 (cognitive extraction) succeeded.  False means
@@ -740,44 +776,57 @@ def extract_cognitive_memories(judgement, trajectory, log_dir, task_name,
             continue
 
         print(f"    [cognitive]   {level}...")
-        dimensions = _extract_level(level, prompt, summary,
-                                    excluded_dimensions=excluded_dim)
+        try:
+            dimensions = _extract_level(level, prompt, summary,
+                                        excluded_dimensions=excluded_dim)
 
-        if dimensions:
-            all_cognitive_data[level] = dimensions
+            if dimensions:
+                all_cognitive_data[level] = dimensions
 
-        for dimension, data in dimensions.items():
-            # Double-check: never save excluded dimensions (defense in depth)
-            if dimension in excluded_dim:
-                print(f"    [cognitive]   SKIP saving {level}/{dimension} (excluded)")
-                continue
+            for dimension, data in dimensions.items():
+                # Double-check: never save excluded dimensions (defense in depth)
+                if dimension in excluded_dim:
+                    print(f"    [cognitive]   SKIP saving {level}/{dimension} (excluded)")
+                    continue
 
-            embedding_text = _build_embedding_text(level, dimension, data,
-                                                       task_text=task)
-            cognitive_text = _build_cognitive_abstract(level, dimension, data)
+                try:
+                    embedding_text = _build_embedding_text(level, dimension, data,
+                                                           task_text=task,
+                                                           use_anchor_in_embedding=use_anchor_in_embedding)
+                    cognitive_text = _build_cognitive_abstract(level, dimension, data)
 
-            entry = {
-                "benchmark": benchmark,
-                "task_name": task_name,
-                "task": task,
-                "llm_judge": judgement,
-                "type": dimension,
-                "level": level,
-                "memory": data,
-                "key_embedding": _embed(embedding_text),
-                "cognitive_embedding": _embed(cognitive_text) if cognitive_text else None,
-                "concrete_anchors": data.get("concrete_anchors", {}) or data.get("concrete_origin", {}),
-            }
+                    entry = {
+                        "benchmark": benchmark,
+                        "task_name": task_name,
+                        "task": task,
+                        "llm_judge": judgement,
+                        "type": dimension,
+                        "level": level,
+                        "memory": data,
+                        "key_embedding": _embed(embedding_text),
+                        "cognitive_embedding": _embed(cognitive_text) if cognitive_text else None,
+                        "concrete_anchors": data.get("concrete_anchors", {}) or data.get("concrete_origin", {}),
+                    }
 
-            pkl_path = f"{parent_dir}/{dimension}_memory.pkl"
-            _save_pkl(pkl_path, entry)
-            count += 1
+                    pkl_path = f"{parent_dir}/{dimension}_memory.pkl"
+                    _save_pkl(pkl_path, entry)
+                    count += 1
+                except Exception:
+                    print(f"    [cognitive]   ERROR saving {level}/{dimension}:")
+                    import traceback
+                    traceback.print_exc()
+        except Exception:
+            print(f"    [cognitive]   ERROR extracting {level}:")
+            import traceback
+            traceback.print_exc()
 
     total_dims = sum(len(d) for d in all_cognitive_data.values())
     print(f"    [cognitive] Extracted {count} cognitive memories "
           f"({total_dims} dimensions across {len(all_cognitive_data)} levels)")
 
     # ---- Phase 3: Derive Traditional Memories (optional) ----
+    # NOTE: this runs even if some levels above failed, as long as we have
+    # at least some cognitive data to work with.
     if derive_traditional:
         print(f"    [cognitive] Phase 3/4: Deriving traditional memories...")
         try:

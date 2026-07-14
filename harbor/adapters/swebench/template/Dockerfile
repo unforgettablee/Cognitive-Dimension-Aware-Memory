@@ -49,6 +49,8 @@ RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ swebench==4.0.3 datas
 # Pre-install mini-swe-agent (avoids GitHub download at runtime, blocked by GFW)
 COPY mini-swe-agent /opt/mini-swe-agent
 RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ /opt/mini-swe-agent --trusted-host mirrors.aliyun.com
+# Install litellm optional dependencies that are eagerly imported at runtime
+RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ fastapi orjson --trusted-host mirrors.aliyun.com
 # Patch litellm cost calculation for unmapped models
 RUN python3 << 'PYEOF'
 import re, site

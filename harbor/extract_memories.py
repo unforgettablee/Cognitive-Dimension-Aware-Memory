@@ -64,7 +64,8 @@ def get_judgement(job_dir: Path) -> bool:
     if result_path.exists():
         result = json.loads(result_path.read_text(encoding="utf-8"))
         verifier = result.get("verifier_result") or {}
-        reward = (verifier or {}).get("rewards", {}).get("reward", 0.0)
+        rewards = (verifier or {}).get("rewards") or {}
+        reward = rewards.get("reward", 0.0)
         return reward >= 1.0
     # Fallback: verifier/reward.txt
     reward_path = job_dir / "verifier" / "reward.txt"
@@ -80,7 +81,8 @@ def get_judgement(job_dir: Path) -> bool:
 def extract_for_task(task_name: str, jobs_dir: Path, memory_dir: Path,
                      derive_traditional: bool = True,
                      excluded_dimensions: list | None = None,
-                     excluded_levels: list | None = None) -> bool:
+                     excluded_levels: list | None = None,
+                     use_anchor_in_embedding: bool = True) -> bool:
     """Extract memories for a single task.
 
     Returns:
@@ -146,6 +148,7 @@ def extract_for_task(task_name: str, jobs_dir: Path, memory_dir: Path,
                 derive_traditional=derive_traditional,
                 excluded_dimensions=excluded_dimensions,
                 excluded_levels=excluded_levels,
+                use_anchor_in_embedding=use_anchor_in_embedding,
             )
             print(f"  DONE: {task_name} (from text log, cognitive_ok={cog_ok})")
             return cog_ok
@@ -200,6 +203,7 @@ def extract_for_task(task_name: str, jobs_dir: Path, memory_dir: Path,
         derive_traditional=derive_traditional,
         excluded_dimensions=excluded_dimensions,
         excluded_levels=excluded_levels,
+        use_anchor_in_embedding=use_anchor_in_embedding,
     )
 
     if cog_ok:
@@ -230,6 +234,11 @@ def main():
     parser.add_argument("--excluded-levels", nargs="*", default=None,
                         help="Abstraction levels to EXCLUDE from extraction "
                              "(e.g. --excluded-levels trajectory workflow)")
+    parser.add_argument("--no-anchor-in-embedding", action="store_true",
+                        help="Exclude concrete file paths, function names, and "
+                             "test commands from the key_embedding vector used "
+                             "for semantic retrieval.  Reduces same-repo "
+                             "vocabulary bias.")
     args = parser.parse_args()
 
     api_key = os.getenv("API_KEY") or os.getenv("DEEPSEEK_API_KEY")
@@ -285,7 +294,8 @@ def main():
             ok = extract_for_task(name, jobs_dir, memory_dir,
                                   derive_traditional=derive_traditional,
                                   excluded_dimensions=args.excluded_dimensions,
-                                  excluded_levels=args.excluded_levels)
+                                  excluded_levels=args.excluded_levels,
+                                  use_anchor_in_embedding=not args.no_anchor_in_embedding)
             if not ok:
                 failed_tasks.append(name)
         except Exception as e:
