@@ -1,0 +1,40 @@
+name: e25_no_anchor_higher_cog_top1
+description: Full COGENT pipeline — no anchor in embedding (same as e21) + higher cognitive rerank weight (alpha_cognitive=0.5) and stricter threshold (floor=0.5) to bias toward LLM structural matching over embedding similarity
+tasks_dir: harbor-tasks/swebench-verified
+start_index: 0
+end_index: 500
+num_tasks: 100
+random_seed: 42
+agent: mini-swe-agent
+model: deepseek/deepseek-chat
+extract_model: deepseek-chat
+llm:
+  api_key: ''
+  base_url: https://api.deepseek.com
+use_memory: true
+pool_dir: memories/sequential-pool-e25
+jobs_dir: jobs/sequential/e25_no_anchor_higher_cog_top1
+only_passed: false
+derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels: []
+agent_kwargs:
+  step_limit: 150
+retrieval_config:
+  features:
+    use_cognitive_rerank: true
+    use_llm_synergy: true
+    use_synergy_selection: true
+    retrieval_source: cognitive
+    use_anchor_in_embedding: false
+  weights:
+    alpha_dual_task: 0.7
+    alpha_semantic: 0.5
+    alpha_cognitive: 0.5
+  retrieval:
+    top_n_candidates: 10
+    top_k: 1
+    min_memories: 0
+  threshold:
+    score_threshold_floor: 0.5
+    score_threshold_std: 0.5

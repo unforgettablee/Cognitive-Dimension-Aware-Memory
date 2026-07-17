@@ -1,0 +1,49 @@
+name: e24_no_anchor_conservative_top2
+description: >-
+  Conservative no-anchor interpolation between E22 and E23: balance semantic
+  and cognitive evidence, inject at most two memories, and abstain on
+  low-confidence retrievals to reduce regressions relative to no-memory.
+
+tasks_dir: harbor-tasks/swebench-verified
+start_index: 0
+end_index: 500
+num_tasks: 100
+random_seed: 42
+
+agent: mini-swe-agent
+model: deepseek/deepseek-chat
+extract_model: deepseek-chat
+
+llm:
+  api_key: ''
+  base_url: https://api.deepseek.com
+
+use_memory: true
+pool_dir: memories/sequential-pool-e24
+jobs_dir: jobs/sequential/e24_no_anchor_conservative_top2
+only_passed: false
+derive_traditional_memory: true
+excluded_dimensions: []
+excluded_levels: []
+
+agent_kwargs:
+  step_limit: 150
+
+retrieval_config:
+  features:
+    use_cognitive_rerank: true
+    use_llm_synergy: true
+    use_synergy_selection: true
+    retrieval_source: cognitive
+    use_anchor_in_embedding: false
+  weights:
+    alpha_dual_task: 0.70
+    alpha_semantic: 0.60
+    alpha_cognitive: 0.40
+  retrieval:
+    top_n_candidates: 10
+    top_k: 2
+    min_memories: 0
+  threshold:
+    score_threshold_floor: 0.55
+    score_threshold_std: 0.0

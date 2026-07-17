@@ -1,16 +1,39 @@
 """Unified Cognitive Memory Retriever.
 
-Four-stage retrieval pipeline:
-  1. Cognitive profile extraction from query
-  2. Dual-score semantic retrieval (task + cognitive embeddings)
-  3. Dimension-aware cognitive rerank (LLM scores each memory on its own dimension)
-  4. Synergy-aware selection (greedy diversity maximization)
+Combines four innovations into a single retrieval pipeline:
+
+1. Dual-Score Semantic Retrieval -- query task text matches memory key_embedding
+   (three-section hybrid) for concrete similarity, while query cognitive profile
+   matches memory cognitive_embedding (pure abstract) for cross-repo pattern
+   matching. Weighted combination prevents abstract signals from being drowned
+   by concrete text.
+
+2. Dimension-Aware Cognitive Rerank -- matches memories by their native
+   cognitive dimension. Causal memories are scored on causal-structure
+   isomorphism, contrastive on anti-pattern relevance, strategic on
+   methodology transferability, environment on repo/tool applicability.
+
+3. Memory Synergy -- the top-K set is selected to maximize joint information
+   value, rewarding complementary pairs and penalizing redundant pairs.
+
+4. Insight Layering -- insight-level memories are excluded from the retrieval
+   pool and instead attached as _linked_insights to selected concrete memories.
+
+Pipeline:
+  Query -> cognitive profile extraction ->
+    dual-score semantic retrieval (task_sim + cog_sim, weighted merge) ->
+    dimension-aware cognitive rerank ->
+    synergy-aware selection -> attach sibling insights -> top-K
 
 Usage:
-    from mtl.retrieval import CognitiveRetriever
-    retriever = CognitiveRetriever("memories/swebench-verified")
-    results = retriever.retrieve("Fix the KeyError in data processing pipeline", top_k=3)
+  retriever = CognitiveRetriever("memories/swebench-verified")
+  results = retriever.retrieve("Fix the KeyError in data processing pipeline", top_k=3)
+  for r in results:
+      print(r["level"], r["type"], r["combined_score"])
+      for ins in r.get("_linked_insights", []):
+          print("  linked insight:", ins.get("type"), ins.get("memory", {}).get("principle_name"))
 """
+import os
 import pickle
 import threading
 from pathlib import Path
@@ -29,9 +52,11 @@ _embed_lock = threading.Lock()
 
 
 def _get_embed_model():
-    """Lazily load SentenceTransformer (thread-safe).
+    """Lazily load the SentenceTransformer model (thread-safe).
 
-    Uses local_files_only=True to avoid HuggingFace network calls.
+    Uses local_files_only=True to avoid network calls to HuggingFace,
+    which would fail in environments without internet access (e.g., China).
+    The model must already be cached locally.
     """
     global _embed_model
     if _embed_model is None:
@@ -43,6 +68,46 @@ def _get_embed_model():
                     local_files_only=True,
                 )
     return _embed_model
+
+
+# Patterns to strip from query task text when use_anchor_in_query_embedding=False.
+# These capture repository-specific concrete anchors (file paths, shell commands,
+# test invocations) that would create false-positive embedding matches across
+# same-repo memories regardless of actual bug relevance.
+import re as _re
+
+_CONCRETE_ANCHOR_PATTERNS: list[tuple[str, str]] = [
+    # File paths: django/db/models/query.py, /testbed/django/..., etc.
+    (r'\b[\w.-]+(?:/[\w.-]+)+\.py\b', ' '),
+    # Python module paths in docstrings/code: django.db.models.query
+    (r'\b[\w]+(?:\.[\w]+){2,}\b', ' '),
+    # Shell commands: cd /testbed && python tests/runtests.py ...
+    (r'(?:cd |python[23]? |pip |git |docker |conda |grep |find |cat |ls |sed |awk |nl |xargs |bash )'
+     r'\S+(?:\s+\S+){0,15}', ' '),
+    # Test runner invocations
+    (r'python (?:-m )?(?:tests\.runtests|pytest|manage\.py test)\S*(?:\s+\S+){0,10}', ' '),
+    # Git SHAs / commit hashes
+    (r'\b[0-9a-f]{7,40}\b', ' '),
+    # URL references to specific GitHub lines
+    (r'https?://github\.com/\S+', ' '),
+]
+_CONCRETE_REPLACEMENTS = [(_re.compile(p), r) for p, r in _CONCRETE_ANCHOR_PATTERNS]
+
+
+def _strip_concrete_terms_for_query(task_text: str) -> str:
+    """Remove repository-specific concrete anchors from query task text.
+
+    When ``use_anchor_in_query_embedding=False``, the query embedding should
+    inhabit the same vocabulary space as the anchor-free memory key_embeddings.
+    This function strips file paths, shell commands, test invocations, and
+    other concrete terms that carry no abstract cognitive signal.
+    """
+    text = task_text
+    for pattern, replacement in _CONCRETE_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    # Collapse whitespace
+    text = _re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 
 class CognitiveRetriever:
@@ -66,29 +131,70 @@ class CognitiveRetriever:
         top_k: int = 3,
         use_cognitive_rerank: bool = True,
         use_llm_synergy: bool = True,
+        use_synergy_selection: bool = True,
         score_threshold_floor: float = 0.45,
         score_threshold_std: float = 0.5,
         min_memories: int = 1,
+        attach_insights: bool = True,
+        retrieval_source: str = "cognitive",
         excluded_dimensions: list | None = None,
         excluded_levels: list | None = None,
+        use_anchor_in_query_embedding: bool = True,
     ):
         """
         Args:
             memory_dir: Path to directory containing *.pkl memory files
-            alpha_semantic: Weight for semantic embedding (vs LLM rerank). Default 0.35.
-            alpha_cognitive: Weight for cognitive relevance (vs semantic). Default 0.65.
-            alpha_dual_task: Task vs cognitive embedding weight. 0.70 = 70% concrete + 30% abstract.
-            top_n_candidates: Candidates before re-ranking
-            top_k: Final memories to return
-            use_cognitive_rerank: Enable LLM cognitive rerank (Step 3)
-            use_llm_synergy: Enable LLM conflict/synergy verification (Step 4)
-            score_threshold_floor: Absolute minimum combined_score
-            score_threshold_std: Multiplier for dynamic threshold (higher = stricter)
-            min_memories: Minimum memories to keep regardless of scores
+            alpha_semantic: Weight for semantic embedding similarity (vs LLM rerank score).
+                            Default 0.35 biases toward LLM cognitive judgment to avoid
+                            surface-similarity negative transfer.
+            alpha_cognitive: Weight for dimension-aware cognitive relevance (vs semantic score).
+                             Default 0.65 prioritizes LLM structural matching over embedding.
+            alpha_dual_task: Within semantic retrieval, weight for task-level similarity
+                             (key_embedding match) vs cognitive-level similarity
+                             (cognitive_embedding match). 0.70 means 70% concrete + 30% abstract.
+            top_n_candidates: How many candidates to retrieve before re-ranking
+            top_k: Final number of memories to return
+            use_cognitive_rerank: Whether to use LLM cognitive rerank (Step 3).
+                                  When enabled, LLM evaluates each memory on its own cognitive
+                                  dimension (causal/contrastive/strategic/environment), catching
+                                  negative transfer cases that embedding similarity misses.
+            use_llm_synergy: Whether to use LLM for conflict/synergy verification in
+                             synergy-aware selection (Step 4). Adds ~1-3 extra LLM calls
+                             but detects genuine memory conflicts and synergies.
+            use_synergy_selection: Whether to use the synergy-aware selection algorithm
+                                   at all (Step 4). When False, memories are selected by
+                                   simple top-K combined_score without any redundancy
+                                   penalty, complementarity bonus, or greedy selection.
+                                   Default True. Set False for E4 (no-synergy) ablation.
+            score_threshold_floor: Absolute minimum combined_score. Memories below
+                                   this are always discarded regardless of distribution.
+            score_threshold_std: Multiplier for standard deviation in relative
+                                 threshold computation. Higher = stricter filtering.
+                                 relative_threshold = median - std_mult * stdev
+            min_memories: Minimum number of memories to keep (prevents empty result
+                          when all scores are borderline).
+            attach_insights: Whether to attach sibling insight memories to selected
+                             concrete memories (Step 5). When False, only concrete
+                             memories are returned without the abstract "why" layer.
+                             Default True.
+            retrieval_source: Which memory files to load from the pool.
+                              "cognitive" (default): load 4x4 cognitive dimension
+                                  files only (causal/contrastive/strategic/environment).
+                              "traditional": load MTL-format files only
+                                  (workflow/local/trajectory/summary/insight).
             excluded_dimensions: Cognitive dimensions to EXCLUDE from retrieval pool.
+                                 Entries whose type matches are skipped during loading.
                                  For dimension leave-one-out ablation (e7--e10).
             excluded_levels: Abstraction levels to EXCLUDE from retrieval pool.
+                             Entries whose level matches are filtered after loading.
                              For abstraction tier leave-one-out ablation (e11--e13).
+            use_anchor_in_query_embedding: If False, strip concrete file paths,
+                function names, and repository-specific vocabulary from the
+                query task text BEFORE computing query_task_emb (channel 1 of
+                dual-score retrieval).  Must match the corresponding
+                ``use_anchor_in_embedding`` setting used during memory
+                extraction so that query and memory vectors inhabit the same
+                vocabulary space.  Default True.
         """
         self.memory_dir = Path(memory_dir)
         self.alpha_semantic = alpha_semantic
@@ -98,11 +204,15 @@ class CognitiveRetriever:
         self.top_k = top_k
         self.use_cognitive_rerank = use_cognitive_rerank
         self.use_llm_synergy = use_llm_synergy
+        self.use_synergy_selection = use_synergy_selection
         self.score_threshold_floor = score_threshold_floor
         self.score_threshold_std = score_threshold_std
         self.min_memories = min_memories
+        self.attach_insights = attach_insights
+        self.retrieval_source = retrieval_source
         self.excluded_dimensions = [d.strip().lower() for d in (excluded_dimensions or [])]
         self.excluded_levels = [l.strip().lower() for l in (excluded_levels or [])]
+        self.use_anchor_in_query_embedding = use_anchor_in_query_embedding
 
         self.memories: list[dict] = []
         self._embeddings: np.ndarray | None = None
@@ -117,13 +227,32 @@ class CognitiveRetriever:
     # Loading
     # -----------------------------------------------------------
     def _load_all(self):
-        """Load all memory pkl files, separate insight layer, precompute embeddings.
+        """Load all memory pkl files, separate insight layer, and precompute embeddings.
 
-        Excluded dimensions (e7--e10 ablation) are skipped at the file level:
-        their pkl files are never loaded.  Excluded levels (e11--e13 ablation)
-        are filtered after loading.
+        When retrieval_source="cognitive" (default), only 4x4 cognitive dimension
+        files (causal/contrastive/strategic/environment) are loaded.
+
+        When retrieval_source="traditional", only MTL-format files
+        (workflow/local/trajectory/summary/insight) are loaded.
+
+        Insight-level memories are excluded from the retrieval pool because their
+        highly abstract content cannot compete with concrete memories in embedding
+        similarity. Instead, they are stored in _task_to_insights and attached as
+        _linked_insights to their sibling concrete memories when those are selected.
         """
-        # Compute which pkl files to skip based on excluded dimensions.
+        # File name patterns for each retrieval source
+        COGNITIVE_PATTERNS = {
+            'causal_memory.pkl', 'contrastive_memory.pkl',
+            'strategic_memory.pkl', 'environment_memory.pkl',
+        }
+        TRADITIONAL_PREFIXES = (
+            'workflow_memory', 'local_memory', 'trajectory_memory',
+            'summary_memory', 'insight_memory',
+        )
+
+        # Build the set of pkl files to exclude based on cognitive dimensions.
+        # For dimension leave-one-out ablation (e7--e10), this prevents the
+        # corresponding memory files from being loaded at all.
         _excluded_pkl_files: set[str] = set()
         if self.excluded_dimensions:
             for dim in self.excluded_dimensions:
@@ -134,14 +263,39 @@ class CognitiveRetriever:
                 print(f"[retriever] Excluded dimensions: {self.excluded_dimensions}"
                       f"  (skipping: {sorted(_excluded_pkl_files)})")
 
+        def _matches_source(filename: str) -> bool:
+            if filename in _excluded_pkl_files:
+                return False
+            if self.retrieval_source == "cognitive":
+                return filename in COGNITIVE_PATTERNS
+            elif self.retrieval_source == "traditional":
+                return filename.startswith(TRADITIONAL_PREFIXES)
+            else:
+                return True  # "all" or unknown -> load everything
+
         pkl_files = sorted(
             p for p in self.memory_dir.glob("*.pkl")
-            if p.name not in _excluded_pkl_files
+            if _matches_source(p.name)
         )
         if not pkl_files:
-            raise FileNotFoundError(f"No .pkl files found in {self.memory_dir}")
+            # No files matched the requested source filter.  Try falling
+            # back to whatever .pkl files ARE present so the experiment
+            # doesn't crash just because the pool was populated by a
+            # different extraction configuration.
+            fallback_files = sorted(self.memory_dir.glob("*.pkl"))
+            if fallback_files:
+                print(f"[retriever] WARNING: no '{self.retrieval_source}' .pkl files "
+                      f"found, falling back to all available pkl files "
+                      f"({[p.name for p in fallback_files]})")
+                pkl_files = fallback_files
+                self.retrieval_source = "all"  # disable source filter for this session
+            else:
+                raise FileNotFoundError(
+                    f"No .pkl files found in {self.memory_dir}"
+                )
 
-        print(f"[retriever] Loading {len(pkl_files)} memory files from {self.memory_dir}")
+        print(f"[retriever] Loading {len(pkl_files)} memory files "
+              f"(source={self.retrieval_source}) from {self.memory_dir}")
 
         skipped_count = 0
         all_entries: list[dict] = []
@@ -163,7 +317,8 @@ class CognitiveRetriever:
                         skipped_count += 1
 
                     if "key_embedding" not in entry:
-                        for alt_emb_key in ("generalized_query_embedding", "embedding"):
+                        for alt_emb_key in ("generalized_query_embedding",
+                                             "embedding"):
                             if alt_emb_key in entry:
                                 entry["key_embedding"] = entry.pop(alt_emb_key)
                                 break
@@ -177,9 +332,12 @@ class CognitiveRetriever:
                 print(f"  [retriever] WARNING: failed to load {pkl_path.name}: {e}")
 
         if skipped_count > 0:
-            print(f"  [retriever] Normalized {skipped_count} legacy entries (missing 'memory' key).")
+            print(f"  [retriever] Normalized {skipped_count} legacy entries "
+                  f"(missing 'memory' wrapper key).")
 
         # Filter by excluded abstraction levels (e11--e13 ablation).
+        # Applied BEFORE insight/concrete separation so that excluded
+        # levels vanish from both the retrieval pool and the insight index.
         if self.excluded_levels:
             n_before = len(all_entries)
             all_entries = [
@@ -190,7 +348,12 @@ class CognitiveRetriever:
             print(f"  [retriever] Excluded levels: {self.excluded_levels}"
                   f"  (filtered {n_before - n_after} entries, {n_after} remain)")
 
-        # Separate insight-level from concrete
+        # Separate insight-level memories from the retrieval pool.
+        # Insight memories are abstract principles, anti-patterns, and
+        # methodologies -- not directly actionable, cannot compete with
+        # concrete memories in embedding similarity. They are stored in
+        # a task-keyed index and will be attached as _linked_insights
+        # when a sibling concrete memory is selected.
         insight_entries: list[dict] = []
         concrete_entries: list[dict] = []
         for entry in all_entries:
@@ -199,27 +362,42 @@ class CognitiveRetriever:
             else:
                 concrete_entries.append(entry)
 
+        # Build task+type -> insights index (for dimension-matched attachment)
         for entry in insight_entries:
             task = entry.get("task_name", "")
+            dim = entry.get("type", "")
             if task:
-                self._task_to_insights.setdefault(task, []).append(entry)
+                # Key by (task, type) so each concrete memory gets only
+                # insights from the same cognitive dimension
+                key = (task, dim)
+                self._task_to_insights.setdefault(key, []).append(entry)
 
+        # Build task -> concrete index (for optional extended linkage)
         for entry in concrete_entries:
             task = entry.get("task_name", "")
             if task:
                 self._task_to_concrete.setdefault(task, []).append(entry)
 
+        # Only concrete memories participate in retrieval
         self.memories = concrete_entries
 
-        # Build key embedding array
         embeddings_list = []
         for mem in self.memories:
             emb = mem.get("key_embedding", [])
-            embeddings_list.append(emb if emb else [0.0] * 384)
+            if emb:
+                embeddings_list.append(emb)
+            else:
+                embeddings_list.append([0.0] * 384)
+
         if embeddings_list:
             self._embeddings = np.array(embeddings_list, dtype=np.float32)
 
-        # Build cognitive embedding array
+        # Build cognitive embedding array for dual-score retrieval.
+        # These are pure-cognitive vectors (no task text, no anchors) that
+        # capture the abstract cognitive pattern of each memory. Matching
+        # query cognitive_profile against these vectors enables cross-repo
+        # pattern retrieval (e.g., finding a causal principle from astropy
+        # when the query is about a Django bug with isomorphic cause structure).
         cog_list = []
         cog_available = 0
         for mem in self.memories:
@@ -228,6 +406,9 @@ class CognitiveRetriever:
                 cog_list.append(cog_emb)
                 cog_available += 1
             else:
+                # For entries without cognitive_embedding (legacy or
+                # cognitive_text was empty), fill with zero vector.
+                # These memories will rely solely on task-level similarity.
                 cog_list.append([0.0] * 384)
         if cog_list:
             self._cognitive_embeddings = np.array(cog_list, dtype=np.float32)
@@ -237,7 +418,7 @@ class CognitiveRetriever:
             "total_memories": len(all_entries),
             "retrieval_pool": len(concrete_entries),
             "insight_attached": len(insight_entries),
-            "tasks_with_insights": len(self._task_to_insights),
+            "tasks_with_insights": len(set(k[0] for k in self._task_to_insights.keys())),
             "total_files": len(pkl_files),
             "dimensions": list(set(m.get("type", "") for m in self.memories)),
             "levels": list(set(m.get("level", "") for m in self.memories)),
@@ -270,6 +451,46 @@ class CognitiveRetriever:
     # -----------------------------------------------------------
     # Retrieval
     # -----------------------------------------------------------
+    def _needs_llm_cognitive_query(self) -> bool:
+        """Return True if an LLM call to extract cognitive query profile is needed.
+
+        The cognitive query serves two purposes:
+          1. Building cognitive_query_text for the cognitive embedding channel
+             (channel 2 of dual-score retrieval).  Only needed when
+             alpha_dual_task < 1.0 (i.e. cognitive channel has >0 weight).
+          2. Building query_profile for dimension-aware cognitive rerank.
+             Only needed when use_cognitive_rerank=True.
+
+        When both are false (pure embedding, MTL traditional, random), the LLM
+        call is a pure waste and can cause spurious failures.
+        """
+        # Cognitive rerank needs the profile
+        if self.use_cognitive_rerank:
+            return True
+        # Cognitive embedding channel needs the query text when it has weight
+        if self.alpha_dual_task < 1.0:
+            return True
+        return False
+
+    def _extract_cognitive_profile_safe(self, task_text: str) -> dict:
+        """Extract cognitive query profile, with fallback on failure.
+
+        Returns a dict with (possibly empty) cognitive profile.  When the
+        LLM call is not needed or fails, returns an empty/default profile
+        so retrieval can continue with task-text-only embedding similarity.
+        """
+        if not self._needs_llm_cognitive_query():
+            print("  [1/4] Cognitive query SKIPPED (embedding-only mode)")
+            return {}
+
+        print("  [1/4] Extracting cognitive query profile...")
+        try:
+            return extract_cognitive_query(task_text)
+        except Exception as e:
+            print(f"  [1/4] WARNING: cognitive query extraction failed: {e}")
+            print(f"  [1/4] Falling back to task-text-only retrieval")
+            return {}
+
     def retrieve(self, task_text: str, top_k: int | None = None) -> list[dict]:
         """Main retrieval entry point.
 
@@ -287,10 +508,12 @@ class CognitiveRetriever:
 
         print(f"\n[retriever] Query: {task_text[:100]}...")
 
-        # Step 1: Extract cognitive profile from query
-        print("  [1/4] Extracting cognitive query profile...")
-        query_profile = extract_cognitive_query(task_text)
+        # Step 1: Extract cognitive profile from query (skipped for pure-embedding mode)
+        query_profile = self._extract_cognitive_profile_safe(task_text)
 
+        # Build cognitive query text from LLM-extracted profile.
+        # This is the abstract cognitive signature of the query, used for
+        # cross-repo pattern matching (channel 2 of dual-score retrieval).
         cognitive_query_parts = []
         cs = query_profile.get("causal_signature", {})
         if cs:
@@ -307,14 +530,29 @@ class CognitiveRetriever:
                 cognitive_query_parts.append(val)
         cognitive_query_text = " ".join(c for c in cognitive_query_parts if c and c != "other")
 
-        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        # Build TWO separate query embeddings for dual-score retrieval:
+        #   Channel 1 (task): raw task text -> matches memory.key_embedding
+        #   Channel 2 (cognitive): pure cognitive text -> matches memory.cognitive_embedding
+        # This separation prevents the concrete task text from drowning out the
+        # cognitive signal in the embedding vector, enabling cross-repo pattern matching.
+        #
+        # When use_anchor_in_query_embedding=False (e21+), strip concrete file
+        # paths, shell commands, and test invocations from the query task text
+        # so that query and memory key_embedding vectors inhabit the same
+        # vocabulary space.
+        _task_text_for_emb = (
+            _strip_concrete_terms_for_query(task_text)
+            if not self.use_anchor_in_query_embedding
+            else task_text
+        )
+        query_task_emb = _get_embed_model().encode(_task_text_for_emb).tolist()
         query_cog_emb = _get_embed_model().encode(cognitive_query_text).tolist() if cognitive_query_text else None
 
         # Step 2: Dual-score semantic retrieval
         print(f"  [2/4] Dual-score semantic retrieval (top {self.top_n})...")
         candidates = self._semantic_retrieve(query_task_emb, query_cog_emb, self.top_n)
 
-        # Step 3: Dimension-aware cognitive rerank
+        # Step 3: Dimension-aware cognitive rerank (optional)
         if self.use_cognitive_rerank:
             print(f"  [3/4] Dimension-aware cognitive rerank (batch LLM)...")
             candidates = cognitive_rerank(
@@ -322,6 +560,9 @@ class CognitiveRetriever:
                 alpha_semantic=self.alpha_semantic,
                 alpha_cognitive=self.alpha_cognitive,
             )
+            # Recompute combined scores to ensure consistency
+            # (cognitive_rerank also computes these, but we re-apply here
+            #  with the identical weights to guard against stale values)
             for cand in candidates:
                 semantic = cand.get("semantic_score", 0.0)
                 cognitive = cand.get("cognitive_score", 0.0)
@@ -351,46 +592,71 @@ class CognitiveRetriever:
 
         candidates.sort(key=lambda c: c.get("combined_score", 0), reverse=True)
 
-        # Step 4: Synergy-aware final selection
-        print(f"  [4/4] Synergy-aware selection (top {k}, llm_synergy={self.use_llm_synergy})...")
-        selected = synergy_aware_selection(candidates, k, use_llm=self.use_llm_synergy)
+        # Step 4: Synergy-aware final selection (or simple top-K if disabled)
+        if self.use_synergy_selection:
+            print(f"  [4/4] Synergy-aware selection (top {k}, llm_synergy={self.use_llm_synergy})...")
+            selected = synergy_aware_selection(candidates, k, use_llm=self.use_llm_synergy)
+        else:
+            print(f"  [4/4] Synergy-aware selection DISABLED, using simple top-{k} by score...")
+            selected = candidates[:k]
+            for mem in selected:
+                mem["synergy_metadata"] = {"selected_by": "simple_topk"}
 
         quality = compute_selection_quality(selected)
         for mem in selected:
             mem["selection_quality"] = quality
 
-        # Dynamic threshold filtering
+        # Step 4.5: Dynamic threshold filtering.
+        # Compute threshold from the full candidate distribution (top-N, reliable
+        # statistics), then apply to the synergy-selected memories. This catches
+        # borderline memories that passed embedding similarity but whose score
+        # falls below the batch-adaptive cutoff.
         dynamic_threshold = self._compute_dynamic_threshold(candidates)
         qualified = [m for m in selected
                      if m.get("combined_score", 0) >= dynamic_threshold]
         n_discarded = len(selected) - len(qualified)
 
+        # Fallback: ensure at least min_memories memories are returned.
+        # When all scores are borderline, we keep the best one(s) rather than
+        # returning nothing.
         if len(qualified) < self.min_memories:
             fallback = sorted(selected,
-                            key=lambda m: m.get("combined_score", 0),
-                            reverse=True)[:self.min_memories]
+                              key=lambda m: m.get("combined_score", 0),
+                              reverse=True)[:self.min_memories]
             qualified = fallback
             n_discarded = len(selected) - len(qualified)
 
         if n_discarded > 0:
             print(f"  [retriever] Dynamic threshold {dynamic_threshold:.3f} "
-                  f"(floor={self.score_threshold_floor}): "
+                  f"(floor={self.score_threshold_floor}, "
+                  f"candidates median used for stats): "
                   f"discarded {n_discarded}, kept {len(qualified)}")
 
         selected = qualified
 
+        # Store threshold metadata on each returned memory for logging/debugging
         for mem in selected:
             mem["_dynamic_threshold"] = round(dynamic_threshold, 4)
 
-        # Step 5: Attach sibling insight memories
-        for mem in selected:
-            task = mem.get("task_name", "")
-            linked = self._task_to_insights.get(task, [])
-            mem["_linked_insights"] = linked
-            if linked:
-                dims = [ins.get("type", "?") for ins in linked]
-                print(f"    -> attached {len(linked)} insight(s) [{', '.join(dims)}] "
-                      f"from task={task}")
+        # Step 5: Attach sibling insight memories to each selected concrete memory.
+        # Insight-level memories (abstract principles, anti-patterns, methodologies)
+        # are not directly retrievable, but when a concrete memory from the same
+        # source task is selected, its sibling insights provide the "why" behind
+        # the "what" -- turning a specific fix into a transferable lesson.
+        # NOTE: Controlled by attach_insights flag (E26 ablation disables this).
+        if self.attach_insights:
+            for mem in selected:
+                task = mem.get("task_name", "")
+                dim = mem.get("type", "")
+                key = (task, dim)
+                linked = self._task_to_insights.get(key, [])
+                mem["_linked_insights"] = linked
+                if linked:
+                    ins_dims = [ins.get("type", "?") for ins in linked]
+                    print(f"    -> attached {len(linked)} insight(s) [{', '.join(ins_dims)}] "
+                          f"from task={task}  (dimension-matched: {dim})")
+        else:
+            print(f"  [retriever] Insight attachment DISABLED (attach_insights=False)")
 
         print(f"  [retriever] Selected {len(selected)} memories "
               f"(threshold={dynamic_threshold:.3f})")
@@ -414,6 +680,9 @@ class CognitiveRetriever:
         retrieval as the normal pipeline (Steps 1--2), then uniformly samples K
         memories from the top-N candidates instead of applying cognitive rerank
         and synergy selection.
+
+        This tests whether COGENT's retrieval pipeline is significantly better
+        than random selection from a semantically relevant candidate set.
         """
         import random as _random_mod
         rng = _random_mod.Random(42)  # Fixed seed for reproducibility
@@ -424,9 +693,9 @@ class CognitiveRetriever:
 
         print(f"\n[retriever-random] Query: {task_text[:100]}...")
 
-        # Step 1: Extract cognitive profile
+        # Step 1: Extract cognitive profile (skipped for pure-embedding mode)
         print("  [R1] Extracting cognitive query profile...")
-        query_profile = extract_cognitive_query(task_text)
+        query_profile = self._extract_cognitive_profile_safe(task_text)
 
         cognitive_query_parts = []
         cs = query_profile.get("causal_signature", {})
@@ -446,31 +715,38 @@ class CognitiveRetriever:
             c for c in cognitive_query_parts if c and c != "other"
         )
 
-        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        _task_text_for_emb = (
+            _strip_concrete_terms_for_query(task_text)
+            if not self.use_anchor_in_query_embedding
+            else task_text
+        )
+        query_task_emb = _get_embed_model().encode(_task_text_for_emb).tolist()
         query_cog_emb = (
             _get_embed_model().encode(cognitive_query_text).tolist()
             if cognitive_query_text else None
         )
 
-        # Step 2: Dual-score semantic retrieval
+        # Step 2: Dual-score semantic retrieval (same as normal pipeline)
         print(f"  [R2] Dual-score semantic retrieval (top {top_n})...")
         candidates = self._semantic_retrieve(query_task_emb, query_cog_emb, top_n)
 
-        # Step 3: Random selection
+        # Step 3: Random selection from top-N
         print(f"  [R3] Randomly selecting {top_k} from {len(candidates)} candidates...")
         n_pick = min(top_k, len(candidates))
         selected = rng.sample(candidates, n_pick) if n_pick > 0 else []
 
-        # Attach insights
+        # Attach insights (respect the attach_insights flag, dimension-matched)
         if self.attach_insights:
             for mem in selected:
                 task = mem.get("task_name", "")
-                linked = self._task_to_insights.get(task, [])
+                dim = mem.get("type", "")
+                key = (task, dim)
+                linked = self._task_to_insights.get(key, [])
                 mem["_linked_insights"] = linked
                 if linked:
-                    dims = [ins.get("type", "?") for ins in linked]
-                    print(f"    -> attached {len(linked)} insight(s) "
-                          f"[{', '.join(dims)}] from task={task}")
+                    ins_dims = [ins.get("type", "?") for ins in linked]
+                    print(f"    -> attached {len(linked)} insight(s) [{', '.join(ins_dims)}] "
+                          f"from task={task}  (dimension-matched: {dim})")
 
         print(f"  [retriever-random] Selected {len(selected)} memories "
               f"(random from top-{len(candidates)} semantic candidates)")
@@ -490,7 +766,12 @@ class CognitiveRetriever:
 
         Used by E16 (LLM direct top-K ablation): runs the same dual-score semantic
         retrieval as the normal pipeline (Steps 1--2), then passes all N candidates
-        to the LLM WITHOUT cognitive dimension labels.
+        to the LLM WITHOUT cognitive dimension labels.  The LLM is asked simply:
+        "which of these memories are most relevant to the query?"  It does NOT
+        see dimension tags, type labels, or facet structure.
+
+        This tests whether the structured dimension-aware pipeline outperforms a
+        flat LLM-as-selector approach on the same semantic candidate set.
         """
         import json as _json
 
@@ -500,9 +781,9 @@ class CognitiveRetriever:
 
         print(f"\n[retriever-llm-direct] Query: {task_text[:100]}...")
 
-        # Step 1: Extract cognitive profile
+        # Step 1: Extract cognitive profile (skipped for pure-embedding mode)
         print("  [D1] Extracting cognitive query profile...")
-        query_profile = extract_cognitive_query(task_text)
+        query_profile = self._extract_cognitive_profile_safe(task_text)
 
         cognitive_query_parts = []
         cs = query_profile.get("causal_signature", {})
@@ -522,7 +803,12 @@ class CognitiveRetriever:
             c for c in cognitive_query_parts if c and c != "other"
         )
 
-        query_task_emb = _get_embed_model().encode(task_text).tolist()
+        _task_text_for_emb = (
+            _strip_concrete_terms_for_query(task_text)
+            if not self.use_anchor_in_query_embedding
+            else task_text
+        )
+        query_task_emb = _get_embed_model().encode(_task_text_for_emb).tolist()
         query_cog_emb = (
             _get_embed_model().encode(cognitive_query_text).tolist()
             if cognitive_query_text else None
@@ -536,11 +822,13 @@ class CognitiveRetriever:
             print("  [retriever-llm-direct] No candidates, returning empty.")
             return []
 
-        # Step 3: LLM direct selection without dimension structure
+        # Step 3: LLM directly selects best K without dimension structure.
+        # Strip the [type=...] prefix so the LLM cannot use cognitive dimension labels.
         print(f"  [D3] LLM direct selection (flat, no dimension labels) from "
               f"{len(candidates)} candidates...")
 
         def _strip_dimension_label(brief: str) -> str:
+            """Remove the [type=... level=... task=...] prefix line."""
             lines = brief.split("\n")
             if lines and lines[0].startswith("[type="):
                 return "\n".join(lines[1:])
@@ -601,12 +889,12 @@ where indices are 0-based candidate numbers."""
         for idx in selected_indices:
             if 0 <= idx < len(candidates):
                 c = candidates[idx]
-                c["cognitive_score"] = 0.5
+                c["cognitive_score"] = 0.5  # neutral score
                 c["cognitive_dimension"] = "llm_direct"
                 c["cognitive_reason"] = "LLM direct selection (no dimension structure)"
                 selected.append(c)
 
-        # Fallback fill
+        # Fallback: fill from semantic top if fewer than top_k selected
         if len(selected) < top_k:
             for c in candidates:
                 if c not in selected:
@@ -617,16 +905,18 @@ where indices are 0-based candidate numbers."""
                     if len(selected) >= top_k:
                         break
 
-        # Attach insights
+        # Attach insights (dimension-matched)
         if self.attach_insights:
             for mem in selected:
                 task = mem.get("task_name", "")
-                linked = self._task_to_insights.get(task, [])
+                dim = mem.get("type", "")
+                key = (task, dim)
+                linked = self._task_to_insights.get(key, [])
                 mem["_linked_insights"] = linked
                 if linked:
-                    dims = [ins.get("type", "?") for ins in linked]
+                    ins_dims = [ins.get("type", "?") for ins in linked]
                     print(f"    -> attached {len(linked)} insight(s) "
-                          f"[{', '.join(dims)}] from task={task}")
+                          f"[{', '.join(ins_dims)}] from task={task}  (dimension-matched: {dim})")
 
         print(f"  [retriever-llm-direct] Selected {len(selected)} memories "
               f"(LLM picked {len(set(selected_indices) & set(range(len(candidates))))} "
@@ -643,7 +933,20 @@ where indices are 0-based candidate numbers."""
     # Internal methods
     # -----------------------------------------------------------
     def _compute_dynamic_threshold(self, candidates: list[dict]) -> float:
-        """Compute dynamic score threshold from candidate distribution."""
+        """Compute a dynamic score threshold from the candidate distribution.
+
+        Uses the full top-N candidate pool (not just the post-synergy K) for
+        reliable statistics. The threshold is:
+
+            max(absolute_floor, median - std_mult * stdev)
+
+        This adapts to the quality of each retrieval batch:
+        - High-quality batch (tight, high scores)  -> higher threshold
+        - Low-quality batch (wide spread, low scores) -> floor acts as safety net
+
+        Falls back to absolute floor when fewer than 3 candidates have non-zero
+        scores (insufficient data for meaningful statistics).
+        """
         scores = [c.get("combined_score", 0) for c in candidates
                   if c.get("combined_score", 0) > 0]
         if not scores:
@@ -663,11 +966,28 @@ where indices are 0-based candidate numbers."""
         query_cog_emb: list[float] | None,
         n: int,
     ) -> list[dict]:
-        """Dual-score semantic retrieval with task + cognitive embeddings."""
+        """Dual-score semantic retrieval.
+
+        Computes two independent cosine similarity scores for each memory:
+
+        - task_score: query raw task text vs memory.key_embedding (three-section hybrid).
+          Captures concrete similarity: same repo, same error pattern, same file paths.
+
+        - cog_score: query cognitive profile vs memory.cognitive_embedding (pure abstract).
+          Captures cognitive pattern similarity: same causal structure, same anti-pattern,
+          regardless of repository or programming language.
+
+        Combined with alpha_dual_task weighting: final = alpha * task + (1-alpha) * cog.
+        Memories missing cognitive_embedding rely solely on task_score.
+
+        This dual-channel approach ensures that cross-repo memories with isomorphic
+        cognitive patterns can enter the top-N candidate set even when their concrete
+        task text shares no vocabulary with the query.
+        """
         if self._embeddings is None or len(self._embeddings) == 0:
             return self.memories[:n]
 
-        # Channel 1: Task-level similarity
+        # --- Task-level similarities (channel 1) ---
         task_vec = np.array(query_task_emb, dtype=np.float32)
         t_norm = np.linalg.norm(task_vec)
         if t_norm > 0:
@@ -680,7 +1000,7 @@ where indices are 0-based candidate numbers."""
         task_sims = np.dot(_key_normed, task_vec)
         task_sims = np.nan_to_num(task_sims, nan=0.0)
 
-        # Channel 2: Cognitive-level similarity
+        # --- Cognitive-level similarities (channel 2) ---
         if query_cog_emb is not None and self._cognitive_embeddings is not None:
             cog_vec = np.array(query_cog_emb, dtype=np.float32)
             c_norm = np.linalg.norm(cog_vec)
@@ -696,7 +1016,7 @@ where indices are 0-based candidate numbers."""
         else:
             cog_sims = np.zeros(len(task_sims), dtype=np.float32)
 
-        # Weighted combination
+        # --- Weighted combination ---
         alpha = self.alpha_dual_task
         final_sims = alpha * task_sims + (1.0 - alpha) * cog_sims
 
@@ -705,6 +1025,7 @@ where indices are 0-based candidate numbers."""
         candidates = []
         for idx in top_indices:
             mem = dict(self.memories[idx])
+            # Store dual-score breakdown for transparency
             mem["semantic_score"] = float(final_sims[idx])
             mem["task_score"] = float(task_sims[idx])
             mem["cog_score"] = float(cog_sims[idx])
@@ -730,13 +1051,14 @@ where indices are 0-based candidate numbers."""
 
     def describe(self) -> str:
         """Human-readable summary of the memory store."""
-        return "\n".join([
+        lines = [
             f"Memory Store: {self.memory_dir}",
             f"  Total memories: {self._stats['total_memories']}",
             f"  Retrieval pool: {self._stats['retrieval_pool']}",
             f"  Dimensions: {self._stats['dimensions']}",
             f"  Levels: {self._stats['levels']}",
             f"  Alpha: semantic={self.alpha_semantic} cognitive={self.alpha_cognitive} dual_task={self.alpha_dual_task}",
-            f"  Cognitive rerank: {self.use_cognitive_rerank} | LLM synergy: {self.use_llm_synergy}",
+            f"  Cognitive rerank: {self.use_cognitive_rerank} | Synergy selection: {self.use_synergy_selection} | LLM synergy: {self.use_llm_synergy}",
             f"  Threshold: floor={self.score_threshold_floor} std_mult={self.score_threshold_std} min_mem={self.min_memories}",
-        ])
+        ]
+        return "\n".join(lines)
