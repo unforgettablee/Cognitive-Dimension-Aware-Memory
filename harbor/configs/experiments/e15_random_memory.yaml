@@ -41,5 +41,5 @@ retrieval_config:
     retrieval_source: cognitive
   retrieval:
     top_n_candidates: 10
-    top_k: 3
+    top_k: 1
     min_memories: 0

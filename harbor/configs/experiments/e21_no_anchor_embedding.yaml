@@ -29,12 +29,12 @@ retrieval_config:
     use_anchor_in_embedding: false
   weights:
     alpha_dual_task: 0.7
-    alpha_semantic: 0.7
-    alpha_cognitive: 0.3
+    alpha_semantic: 0.5
+    alpha_cognitive: 0.5
   retrieval:
     top_n_candidates: 10
-    top_k: 3
+    top_k: 1
     min_memories: 0
   threshold:
-    score_threshold_floor: 0.45
+    score_threshold_floor: 0.5
     score_threshold_std: 0.5

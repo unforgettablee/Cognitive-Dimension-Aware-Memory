@@ -47,39 +47,125 @@ def _get_deepseek_client() -> OpenAI:
 # ---------------------------------------------------------------
 # Prompt 1: Extract cognitive profile from query (1 LLM call)
 # ---------------------------------------------------------------
-COGNITIVE_QUERY_PROMPT = """\
+# The prompt is composed from dimension-specific parts so that excluded
+# dimensions (e.g. for e8-e11 ablation experiments) can be selectively
+# removed before the LLM call.
+
+_ALL_QUERY_DIMENSIONS = ["causal", "contrastive", "strategic", "environment"]
+
+_QUERY_PROMPT_PREFIX = """\
 You are analyzing a coding task to determine what KIND of prior experience would
 be most helpful. Given a task description, assess which cognitive dimensions are
 needed and extract the relevant structural information.
 
 Output a JSON object (no markdown) with this structure:
 {
-  "task_type": "debug|feature|refactor|config|test|other",
+  "task_type": "debug|feature|refactor|config|test|other","""
+
+_QUERY_PROMPT_CAUSAL = """
   "need_causal": true/false,
-  "need_contrastive": true/false,
-  "need_strategic": true/false,
-  "need_environment": true/false,
   "causal_signature": {
     "error_category": "type_error|import_error|logic_error|runtime_error|test_failure|build_error|performance|other",
     "cause_category": "missing_dependency|version_mismatch|incorrect_assumption|side_effect|race_condition|off_by_one|api_misuse|config_error|other",
     "intervention_type": "add_dependency|modify_logic|reorder_operations|add_validation|change_config|refactor_structure|other",
     "causal_chain": ["abstract step 1", "abstract step 2", "..."],
     "causal_signature": "One sentence in domain-independent causal language"
-  },
-  "contrastive_needs": "What kind of failure patterns or anti-patterns would be relevant? Leave empty if not needed.",
-  "strategic_needs": "What kind of methodology or decision strategy would help? Leave empty if not needed.",
-  "environment_needs": "What repo/tool knowledge would help? Leave empty if not needed.",
+  },"""
+
+_QUERY_PROMPT_CONTRASTIVE = """
+  "need_contrastive": true/false,
+  "contrastive_needs": "What kind of failure patterns or anti-patterns would be relevant? Leave empty if not needed.","""
+
+_QUERY_PROMPT_STRATEGIC = """
+  "need_strategic": true/false,
+  "strategic_needs": "What kind of methodology or decision strategy would help? Leave empty if not needed.","""
+
+_QUERY_PROMPT_ENVIRONMENT = """
+  "need_environment": true/false,
+  "environment_needs": "What repo/tool knowledge would help? Leave empty if not needed.","""
+
+_QUERY_PROMPT_SUFFIX = """
   "query_summary": "One sentence describing the essence of this task"
 }"""
 
+# Mapping for dimension-specific prompt parts (used by _build_query_prompt).
+_DIM_PROMPT_PARTS: dict[str, str] = {
+    "causal": _QUERY_PROMPT_CAUSAL,
+    "contrastive": _QUERY_PROMPT_CONTRASTIVE,
+    "strategic": _QUERY_PROMPT_STRATEGIC,
+    "environment": _QUERY_PROMPT_ENVIRONMENT,
+}
 
-def extract_cognitive_query(task_text: str) -> dict:
-    """Extract cognitive profile and causal signature from a query. 1 LLM call."""
+# Full prompt (all dimensions active) — kept for backward compatibility.
+COGNITIVE_QUERY_PROMPT = (
+    _QUERY_PROMPT_PREFIX
+    + _QUERY_PROMPT_CAUSAL
+    + _QUERY_PROMPT_CONTRASTIVE
+    + _QUERY_PROMPT_STRATEGIC
+    + _QUERY_PROMPT_ENVIRONMENT
+    + _QUERY_PROMPT_SUFFIX
+)
+
+
+def _build_query_prompt(excluded_dimensions: list[str] | None) -> str:
+    """Build a cognitive query prompt with only the active dimensions.
+
+    When ``excluded_dimensions`` is empty or None, returns the full prompt
+    (identical to ``COGNITIVE_QUERY_PROMPT``).  Otherwise, the excluded
+    dimension blocks are omitted so the LLM is never asked to produce them.
+    """
+    excluded = [d.strip().lower() for d in (excluded_dimensions or [])]
+    if not excluded:
+        return COGNITIVE_QUERY_PROMPT
+
+    active = [d for d in _ALL_QUERY_DIMENSIONS if d not in excluded]
+    parts = [_QUERY_PROMPT_PREFIX]
+    for dim in active:
+        parts.append(_DIM_PROMPT_PARTS[dim])
+    parts.append(_QUERY_PROMPT_SUFFIX)
+    return "".join(parts)
+
+
+def _post_process_query_profile(profile: dict, excluded_dimensions: list[str] | None) -> dict:
+    """Zero out excluded dimensions in the query profile.
+
+    Defense in depth: even with a filtered prompt the LLM may occasionally
+    include excluded dimensions.  This post-processing guarantees that
+    ``need_<dim>`` is False and the corresponding fields are cleared.
+    """
+    excluded = [d.strip().lower() for d in (excluded_dimensions or [])]
+    if not excluded:
+        return profile
+
+    for dim in excluded:
+        profile[f"need_{dim}"] = False
+        if dim == "causal":
+            profile["causal_signature"] = {}
+        else:
+            profile[f"{dim}_needs"] = ""
+
+    return profile
+
+
+def extract_cognitive_query(task_text: str,
+                            excluded_dimensions: list[str] | None = None) -> dict:
+    """Extract cognitive profile and causal signature from a query. 1 LLM call.
+
+    Args:
+        task_text: The task description / instruction text.
+        excluded_dimensions: Cognitive dimensions to exclude from the query
+            profile (e.g. ``["causal"]`` for e8).  The LLM prompt is filtered
+            so these dimensions are not requested, and the result is
+            post-processed as a defense-in-depth guarantee.
+    """
+    excluded = [d.strip().lower() for d in (excluded_dimensions or [])]
+    prompt = _build_query_prompt(excluded)
+
     try:
         response = _get_deepseek_client().chat.completions.create(
             model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
-                {"role": "system", "content": COGNITIVE_QUERY_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": f"### Task:\n{task_text}"},
             ],
             timeout=120.0,
@@ -91,10 +177,11 @@ def extract_cognitive_query(task_text: str) -> dict:
             if raw.endswith("```"):
                 raw = raw[:-3]
             raw = raw.strip()
-        return json.loads(raw)
+        profile = json.loads(raw)
+        return _post_process_query_profile(profile, excluded)
     except Exception:
         print("  [cognitive] Failed to extract cognitive query, using fallback")
-        return {
+        profile = {
             "task_type": "other",
             "need_causal": True, "need_contrastive": True,
             "need_strategic": True, "need_environment": True,
@@ -108,6 +195,7 @@ def extract_cognitive_query(task_text: str) -> dict:
             "query_summary": task_text[:200],
             "_fallback": True,
         }
+        return _post_process_query_profile(profile, excluded)
 
 
 # ---------------------------------------------------------------
@@ -518,9 +606,10 @@ def cognitive_rerank(
 
 
 # ---- Backward compatibility alias ----
-def extract_causal_query(task_text: str) -> dict:
+def extract_causal_query(task_text: str,
+                         excluded_dimensions: list[str] | None = None) -> dict:
     """Alias: extract cognitive profile (includes causal signature)."""
-    return extract_cognitive_query(task_text)
+    return extract_cognitive_query(task_text, excluded_dimensions=excluded_dimensions)
 
 
 def causal_rerank(query_causal: dict, candidates: list[dict]) -> list[dict]:

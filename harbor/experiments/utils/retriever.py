@@ -462,6 +462,9 @@ class CognitiveRetriever:
         Returns a dict with (possibly empty) cognitive profile.  When the
         LLM call is not needed or fails, returns an empty/default profile
         so retrieval can continue with task-text-only embedding similarity.
+
+        Excluded dimensions (from ``self.excluded_dimensions``) are passed
+        to the LLM so the query profile is consistent with the memory pool.
         """
         if not self._needs_llm_cognitive_query():
             print("  [1/4] Cognitive query SKIPPED (embedding-only mode)")
@@ -469,7 +472,8 @@ class CognitiveRetriever:
 
         print("  [1/4] Extracting cognitive query profile...")
         try:
-            return extract_cognitive_query(task_text)
+            return extract_cognitive_query(task_text,
+                                           excluded_dimensions=self.excluded_dimensions)
         except Exception as e:
             print(f"  [1/4] WARNING: cognitive query extraction failed: {e}")
             print(f"  [1/4] Falling back to task-text-only retrieval")

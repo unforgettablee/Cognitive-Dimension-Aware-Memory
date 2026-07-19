@@ -32,7 +32,7 @@ retrieval_config:
     alpha_cognitive: 0.0
   retrieval:
     top_n_candidates: 20
-    top_k: 3
+    top_k: 1
     min_memories: 0
   threshold:
     score_threshold_floor: 0.0
