@@ -1,4 +1,4 @@
-name: e23_no_anchor_higher_cog
+name: e23_no_anchor_higher_cog_top3
 description: Full COGENT pipeline — no anchor in embedding (same as e21) + higher cognitive rerank weight (alpha_cognitive=0.5) and stricter threshold (floor=0.5) to bias toward LLM structural matching over embedding similarity
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
@@ -13,7 +13,7 @@ llm:
   base_url: https://api.deepseek.com
 use_memory: true
 pool_dir: memories/sequential-pool-e23
-jobs_dir: jobs/sequential/e23_no_anchor_higher_cog
+jobs_dir: jobs/sequential/e23_no_anchor_higher_cog_top3
 only_passed: false
 derive_traditional_memory: true
 excluded_dimensions: []

@@ -32,7 +32,7 @@ retrieval_config:
     alpha_semantic: 1.0
     alpha_cognitive: 0.0
   retrieval:
-    top_n_candidates: 20
+    top_n_candidates: 10
     top_k: 1
     min_memories: 0
   threshold:

@@ -1,6 +1,6 @@
 # E7: No memory baseline (sequential)
 # Each task runs independently — no memory retrieval at all
-name: "e7_no_memory"
+name: e7_no_memory
 description: "Sequential baseline: no memory retrieval, tasks run independently"
 
 tasks_dir: "harbor-tasks/swebench-verified"

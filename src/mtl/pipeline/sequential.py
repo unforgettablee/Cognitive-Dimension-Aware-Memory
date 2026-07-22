@@ -303,6 +303,8 @@ class SequentialPipeline:
                 judgement, trajectory, log_dir,
                 task_name, task, commands, "swebench-verified",
                 derive_traditional=self.config.derive_traditional_memory,
+                excluded_dimensions=self.config.excluded_dimensions,
+                excluded_levels=self.config.excluded_levels,
             )
             return True
         except Exception as e:

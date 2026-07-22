@@ -1,5 +1,6 @@
-name: e21_no_anchor_embedding
-description: Full COGENT pipeline with all features enabled — anchor signals excluded from semantic embedding (use_anchor_in_embedding=false) to reduce same-repo vocabulary bias
+name: e27_no_causal_no_contrasive
+description: 'Sequential: full system without causal dimension — contrastive+strategic+environment
+  only'
 tasks_dir: harbor-tasks/swebench-verified
 start_index: 0
 end_index: 500
@@ -12,19 +13,21 @@ llm:
   api_key: ''
   base_url: https://api.deepseek.com
 use_memory: true
-pool_dir: memories/sequential-pool-e21
-jobs_dir: jobs/sequential/e21_no_anchor_embedding
+pool_dir: memories/sequential-pool-e27
+jobs_dir: jobs/sequential/e27_no_causal_no_contrasive
 only_passed: false
 derive_traditional_memory: true
-excluded_dimensions: []
+excluded_dimensions:
+- causal
+- contrastive
 excluded_levels: []
 agent_kwargs:
   step_limit: 150
 retrieval_config:
   features:
-    use_cognitive_rerank: false
-    use_llm_synergy: false
-    use_synergy_selection: false
+    use_cognitive_rerank: true
+    use_llm_synergy: true
+    use_synergy_selection: true
     retrieval_source: cognitive
     use_anchor_in_embedding: false
   weights:
@@ -32,7 +35,7 @@ retrieval_config:
     alpha_semantic: 0.5
     alpha_cognitive: 0.5
   retrieval:
-    top_n_candidates: 1
+    top_n_candidates: 10
     top_k: 1
     min_memories: 0
   threshold:

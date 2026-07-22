@@ -23,8 +23,8 @@ agent_kwargs:
 retrieval_config:
   features:
     use_cognitive_rerank: true
-    use_llm_synergy: true
-    use_synergy_selection: true
+    use_llm_synergy: false
+    use_synergy_selection: false
     retrieval_source: cognitive
   weights:
     alpha_dual_task: 0.7
